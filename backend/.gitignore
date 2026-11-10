@@ -1,0 +1,29 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+!.env.example
+*.sqlite3
+media/
+staticfiles/
+.DS_Store
+.idea/
+.vscode/
+
+# Project requirement / design documents (do not push)
+*.pdf
+*.docx
+SOFTWARE REQUIREMENTS SPECIFICATION (SRS).pdf
+Corrected_Project_Task_Management_Database_Design_Readable.docx
+
+# Frontend lives in a separate React project (do not include here)
+frontend/
+client/
+web/
+node_modules/
+package.json
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
