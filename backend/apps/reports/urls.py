@@ -1,5 +1,6 @@
 from django.urls import path
+from .views import TaskExportReportView
 
 urlpatterns = [
-    # Endpoint routes will be added by the assigned developer.
+    path("tasks/", TaskExportReportView.as_view(), name="report-tasks"),
 ]

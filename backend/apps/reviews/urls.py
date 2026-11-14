@@ -1,5 +1,10 @@
-from django.urls import path
+from django.urls import include, path
+from rest_framework.routers import DefaultRouter
+from .views import TaskReviewViewSet
+
+router = DefaultRouter()
+router.register(r"", TaskReviewViewSet, basename="task-review")
 
 urlpatterns = [
-    # Endpoint routes will be added by the assigned developer.
+    path("", include(router.urls)),
 ]

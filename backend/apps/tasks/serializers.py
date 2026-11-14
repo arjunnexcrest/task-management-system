@@ -1,1 +1,515 @@
-# Serializers will be implemented by the assigned developer.
+from django.utils import timezone
+from rest_framework import serializers
+from apps.common.serializers import CompanyScopedValidationMixin
+from .models import (
+    Attachment,
+    Checklist,
+    ChecklistItem,
+    CommentAttachment,
+    CommentMention,
+    Task,
+    TaskAssignment,
+    TaskAttachment,
+    TaskComment,
+    TaskDependency,
+    TaskTag,
+    TaskTagAssignment,
+)
+
+ALLOWED_ATTACHMENT_MIME_PREFIXES = (
+    "application/pdf",
+    "application/msword",
+    "application/vnd.",
+    "image/",
+    "text/",
+    "application/zip",
+    "application/json",
+)
+MAX_ATTACHMENT_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
+
+
+class TaskTagSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = TaskTag
+        fields = ["id", "name"]
+        read_only_fields = ["id"]
+
+
+class TaskTagAssignmentSerializer(serializers.ModelSerializer):
+    tag_name = serializers.CharField(source="tag.name", read_only=True)
+
+    class Meta:
+        model = TaskTagAssignment
+        fields = ["id", "task", "tag", "tag_name"]
+        read_only_fields = ["id"]
+
+
+class TaskAssignmentSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
+    user_name = serializers.CharField(source="user.full_name", read_only=True, default=None)
+    user_email = serializers.CharField(source="user.email", read_only=True, default=None)
+    team_name = serializers.CharField(source="team.name", read_only=True, default=None)
+    assigned_by_name = serializers.CharField(source="assigned_by.full_name", read_only=True, default=None)
+
+    class Meta:
+        model = TaskAssignment
+        fields = [
+            "id",
+            "task",
+            "user",
+            "user_name",
+            "user_email",
+            "team",
+            "team_name",
+            "assignment_type",
+            "assigned_by",
+            "assigned_by_name",
+            "assigned_at",
+            "ended_at",
+            "status",
+        ]
+        read_only_fields = ["id", "assigned_at"]
+        extra_kwargs = {"assigned_by": {"required": False}}
+
+    def validate(self, attrs):
+        task = attrs.get("task") or getattr(self.instance, "task", None)
+        assignment_type = attrs.get("assignment_type") or getattr(
+            self.instance, "assignment_type", TaskAssignment.AssignmentType.USER
+        )
+        user = attrs.get("user") if "user" in attrs else getattr(self.instance, "user", None)
+        team = attrs.get("team") if "team" in attrs else getattr(self.instance, "team", None)
+
+        if assignment_type == TaskAssignment.AssignmentType.USER:
+            if not user or team is not None:
+                raise serializers.ValidationError(
+                    "When assignment_type is 'User', user must be set and team must be null (DB Design §5)."
+                )
+            if task:
+                self.validate_user_in_company(user, task.project.company, field_label="Assignee user")
+        elif assignment_type == TaskAssignment.AssignmentType.TEAM:
+            if not team or user is not None:
+                raise serializers.ValidationError(
+                    "When assignment_type is 'Team', team must be set and user must be null (DB Design §5)."
+                )
+            if task:
+                self.validate_team_in_company(team, task.project.company)
+        return attrs
+
+
+class TaskDependencySerializer(serializers.ModelSerializer):
+    depends_on_title = serializers.CharField(source="depends_on_task.title", read_only=True)
+    depends_on_status = serializers.CharField(source="depends_on_task.status", read_only=True)
+
+    class Meta:
+        model = TaskDependency
+        fields = [
+            "id",
+            "task",
+            "depends_on_task",
+            "depends_on_title",
+            "depends_on_status",
+            "dependency_type",
+            "created_at",
+        ]
+        read_only_fields = ["id", "created_at"]
+
+    def validate(self, attrs):
+        task = attrs.get("task") or getattr(self.instance, "task", None)
+        depends_on_task = attrs.get("depends_on_task") or getattr(self.instance, "depends_on_task", None)
+        if task and depends_on_task:
+            if task.id == depends_on_task.id:
+                raise serializers.ValidationError("A task cannot depend on itself (DB Design §5).")
+            if task.project_id != depends_on_task.project_id:
+                raise serializers.ValidationError(
+                    "Dependent tasks must belong to the same project (DB Design §4.4 & §5)."
+                )
+            # Cycle detection across TaskDependency graph
+            visited = {task.id}
+            queue = [depends_on_task.id]
+            while queue:
+                current_id = queue.pop(0)
+                if current_id in visited:
+                    raise serializers.ValidationError(
+                        "Circular task dependency detected; dependency cycles are not allowed (DB Design §5)."
+                    )
+                visited.add(current_id)
+                prereqs = TaskDependency.objects.filter(task_id=current_id).values_list(
+                    "depends_on_task_id", flat=True
+                )
+                queue.extend(prereqs)
+        return attrs
+
+
+class ChecklistItemSerializer(serializers.ModelSerializer):
+    completed_by_name = serializers.CharField(source="completed_by.full_name", read_only=True, default=None)
+
+    class Meta:
+        model = ChecklistItem
+        fields = [
+            "id",
+            "checklist",
+            "title",
+            "is_completed",
+            "notes",
+            "link",
+            "sort_order",
+            "completed_by",
+            "completed_by_name",
+            "completed_at",
+        ]
+        read_only_fields = ["id", "completed_at"]
+
+
+class ChecklistSerializer(serializers.ModelSerializer):
+    items = ChecklistItemSerializer(many=True, read_only=True)
+    completion_percentage = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Checklist
+        fields = [
+            "id",
+            "task",
+            "title",
+            "sort_order",
+            "created_by",
+            "created_at",
+            "items",
+            "completion_percentage",
+        ]
+        read_only_fields = ["id", "created_at"]
+        extra_kwargs = {"created_by": {"required": False}}
+
+    def get_completion_percentage(self, obj):
+        items = list(obj.items.all())
+        total = len(items)
+        if total == 0:
+            return 0.0
+        done = sum(1 for item in items if item.is_completed)
+        return round((done / total) * 100.0, 2)
+
+
+class CommentMentionSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
+    mentioned_user_name = serializers.CharField(source="mentioned_user.full_name", read_only=True)
+
+    class Meta:
+        model = CommentMention
+        fields = ["id", "comment", "mentioned_user", "mentioned_user_name"]
+        read_only_fields = ["id"]
+
+    def validate(self, attrs):
+        comment = attrs.get("comment") or getattr(self.instance, "comment", None)
+        mentioned_user = attrs.get("mentioned_user") or getattr(self.instance, "mentioned_user", None)
+        if comment and mentioned_user:
+            self.validate_user_in_company(
+                mentioned_user,
+                comment.task.project.company,
+                field_label="Mentioned user",
+            )
+        return attrs
+
+
+class TaskCommentSerializer(serializers.ModelSerializer):
+    author_name = serializers.CharField(source="author.full_name", read_only=True)
+    mentions = CommentMentionSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = TaskComment
+        fields = [
+            "id",
+            "task",
+            "author",
+            "author_name",
+            "parent_comment",
+            "content",
+            "mentions",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at"]
+        extra_kwargs = {"author": {"required": False}}
+
+    def validate(self, attrs):
+        task = attrs.get("task") or getattr(self.instance, "task", None)
+        parent_comment = attrs.get("parent_comment")
+        if task and parent_comment and parent_comment.task_id != task.id:
+            raise serializers.ValidationError("Parent comment must belong to the same task.")
+        return attrs
+
+
+class AttachmentSerializer(serializers.ModelSerializer):
+    """
+    Per DB Design §5 & §7 Rule #9:
+    - Validates MIME type and file size on upload.
+    - Does NOT expose raw unrestricted `storage_key` on read (`write_only=True`);
+      instead returns a permission-checked `download_url`.
+    """
+
+    uploaded_by_name = serializers.CharField(source="uploaded_by.full_name", read_only=True)
+    download_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Attachment
+        fields = [
+            "id",
+            "uploaded_by",
+            "uploaded_by_name",
+            "file_name",
+            "storage_key",
+            "download_url",
+            "mime_type",
+            "file_size_bytes",
+            "checksum",
+            "uploaded_at",
+        ]
+        read_only_fields = ["id", "uploaded_at", "download_url"]
+        extra_kwargs = {
+            "storage_key": {"write_only": True},
+            "uploaded_by": {"required": False},
+        }
+
+    def get_download_url(self, obj):
+        return f"/api/tasks/attachments/{obj.id}/download/"
+
+    def validate_mime_type(self, value):
+        if not value or not value.startswith(ALLOWED_ATTACHMENT_MIME_PREFIXES):
+            raise serializers.ValidationError(f"Unsupported MIME type '{value}'.")
+        return value
+
+    def validate_file_size_bytes(self, value):
+        if value <= 0 or value > MAX_ATTACHMENT_SIZE_BYTES:
+            raise serializers.ValidationError("File size must be between 1 byte and 50 MB.")
+        return value
+
+
+class TaskAttachmentSerializer(serializers.ModelSerializer):
+    attachment_detail = AttachmentSerializer(source="attachment", read_only=True)
+
+    class Meta:
+        model = TaskAttachment
+        fields = ["id", "task", "attachment", "attachment_detail"]
+        read_only_fields = ["id"]
+
+
+class CommentAttachmentSerializer(serializers.ModelSerializer):
+    attachment_detail = AttachmentSerializer(source="attachment", read_only=True)
+
+    class Meta:
+        model = CommentAttachment
+        fields = ["id", "comment", "attachment", "attachment_detail"]
+        read_only_fields = ["id"]
+
+
+class SubtaskNestedSerializer(serializers.ModelSerializer):
+    task_owner_name = serializers.CharField(source="task_owner.full_name", read_only=True, default=None)
+
+    class Meta:
+        model = Task
+        fields = [
+            "id",
+            "project",
+            "parent_task",
+            "title",
+            "priority",
+            "status",
+            "start_date",
+            "due_date",
+            "estimated_effort",
+            "progress",
+            "task_owner",
+            "task_owner_name",
+            "created_at",
+            "completed_at",
+        ]
+        read_only_fields = ["id", "created_at", "completed_at"]
+
+
+class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
+    project_name = serializers.CharField(source="project.name", read_only=True)
+    project_code = serializers.CharField(source="project.code", read_only=True)
+    phase_name = serializers.CharField(source="phase.name", read_only=True, default=None)
+    department_name = serializers.CharField(source="department.name", read_only=True, default=None)
+    team_name = serializers.CharField(source="team.name", read_only=True, default=None)
+    task_owner_name = serializers.CharField(source="task_owner.full_name", read_only=True, default=None)
+    created_by_name = serializers.CharField(source="created_by.full_name", read_only=True, default=None)
+    reviewer_name = serializers.CharField(source="reviewer.full_name", read_only=True, default=None)
+    is_subtask = serializers.BooleanField(read_only=True)
+    is_overdue = serializers.SerializerMethodField()
+    subtasks_count = serializers.SerializerMethodField()
+    active_assignments = serializers.SerializerMethodField()
+    tags = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Task
+        fields = [
+            "id",
+            "project",
+            "project_name",
+            "project_code",
+            "parent_task",
+            "is_subtask",
+            "phase",
+            "phase_name",
+            "department",
+            "department_name",
+            "team",
+            "team_name",
+            "title",
+            "description",
+            "task_owner",
+            "task_owner_name",
+            "created_by",
+            "created_by_name",
+            "reviewer",
+            "reviewer_name",
+            "priority",
+            "status",
+            "start_date",
+            "due_date",
+            "estimated_effort",
+            "progress",
+            "progress_method",
+            "approval_required",
+            "is_overdue",
+            "subtasks_count",
+            "active_assignments",
+            "tags",
+            "created_at",
+            "updated_at",
+            "completed_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at", "completed_at"]
+        extra_kwargs = {"created_by": {"required": False}}
+
+    def validate(self, attrs):
+        project = attrs.get("project") or getattr(self.instance, "project", None)
+        parent_task = (
+            attrs.get("parent_task")
+            if "parent_task" in attrs
+            else getattr(self.instance, "parent_task", None)
+        )
+        phase = attrs.get("phase") if "phase" in attrs else getattr(self.instance, "phase", None)
+        department = (
+            attrs.get("department")
+            if "department" in attrs
+            else getattr(self.instance, "department", None)
+        )
+        team = attrs.get("team") if "team" in attrs else getattr(self.instance, "team", None)
+        task_owner = (
+            attrs.get("task_owner")
+            if "task_owner" in attrs
+            else getattr(self.instance, "task_owner", None)
+        )
+        reviewer = (
+            attrs.get("reviewer")
+            if "reviewer" in attrs
+            else getattr(self.instance, "reviewer", None)
+        )
+        start_date = (
+            attrs.get("start_date")
+            if "start_date" in attrs
+            else getattr(self.instance, "start_date", None)
+        )
+        due_date = (
+            attrs.get("due_date")
+            if "due_date" in attrs
+            else getattr(self.instance, "due_date", None)
+        )
+
+        if project:
+            company = project.company
+            if parent_task:
+                if self.instance and parent_task.id == self.instance.id:
+                    raise serializers.ValidationError({"parent_task": "A task cannot be its own parent."})
+                if parent_task.project_id != project.id:
+                    raise serializers.ValidationError(
+                        {"parent_task": "Parent task and subtask must belong to the same project (DB Design §5)."}
+                    )
+            if phase and phase.project_id != project.id:
+                raise serializers.ValidationError(
+                    {"phase": "Selected phase does not belong to the task's project."}
+                )
+            if department:
+                self.validate_department_in_company(department, company)
+            if team:
+                self.validate_team_in_company(team, company, department=department)
+            if task_owner:
+                self.validate_user_in_company(task_owner, company, field_label="Task owner")
+            if reviewer:
+                self.validate_user_in_company(reviewer, company, field_label="Reviewer")
+
+        if start_date and due_date and due_date < start_date:
+            raise serializers.ValidationError({"due_date": "Due date cannot be earlier than start date."})
+
+        return attrs
+
+    def get_is_overdue(self, obj):
+        if obj.due_date and obj.status not in [Task.Status.COMPLETED, Task.Status.CANCELLED]:
+            return obj.due_date < timezone.now().date()
+        return False
+
+    def get_subtasks_count(self, obj):
+        if hasattr(obj, "annotated_subtasks_count"):
+            return obj.annotated_subtasks_count
+        return obj.subtasks.count()
+
+    def get_active_assignments(self, obj):
+        assignments = [
+            a for a in obj.assignments.all() if a.status in ("Active", "Acknowledged")
+        ]
+        return [
+            {
+                "id": a.id,
+                "assignment_type": a.assignment_type,
+                "user_id": a.user_id,
+                "user_name": a.user.full_name if a.user else None,
+                "team_id": a.team_id,
+                "team_name": a.team.name if a.team else None,
+                "status": a.status,
+                "assigned_at": a.assigned_at,
+            }
+            for a in assignments
+        ]
+
+    def get_tags(self, obj):
+        return [ta.tag.name for ta in obj.tag_assignments.all()]
+
+
+class TaskDetailSerializer(TaskSerializer):
+    """
+    Per DB Design §8:
+    - Task detail: retrieves task + project + owner + creator + department/team with select_related;
+      retrieves assignments, checklists and tags with prefetch_related.
+    - Task history (comments, progress updates, reviews, time entries) is also exposed via
+      dedicated paginated endpoints (`/api/tasks/{id}/comments/`, `/progress-updates/`, `/reviews/`, `/time-entries/`).
+    """
+
+    subtasks = SubtaskNestedSerializer(many=True, read_only=True)
+    assignments = TaskAssignmentSerializer(many=True, read_only=True)
+    dependencies = TaskDependencySerializer(many=True, read_only=True)
+    checklists = ChecklistSerializer(many=True, read_only=True)
+    comments = serializers.SerializerMethodField()
+    task_attachments = TaskAttachmentSerializer(many=True, read_only=True)
+    history_endpoints = serializers.SerializerMethodField()
+
+    class Meta(TaskSerializer.Meta):
+        fields = TaskSerializer.Meta.fields + [
+            "subtasks",
+            "assignments",
+            "dependencies",
+            "checklists",
+            "comments",
+            "task_attachments",
+            "history_endpoints",
+        ]
+
+    def get_comments(self, obj):
+        # Return latest 20 comments in detail view; full history is paginated at /api/tasks/{id}/comments/
+        recent_comments = obj.comments.all()[:20]
+        return TaskCommentSerializer(recent_comments, many=True).data
+
+    def get_history_endpoints(self, obj):
+        return {
+            "comments": f"/api/tasks/{obj.id}/comments/",
+            "progress_updates": f"/api/tasks/{obj.id}/progress-updates/",
+            "reviews": f"/api/tasks/{obj.id}/reviews/",
+            "time_entries": f"/api/tasks/{obj.id}/time-entries/",
+        }

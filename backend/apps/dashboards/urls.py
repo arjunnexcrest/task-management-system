@@ -1,5 +1,6 @@
 from django.urls import path
+from .views import DashboardSummaryView
 
 urlpatterns = [
-    # Endpoint routes will be added by the assigned developer.
+    path("summary/", DashboardSummaryView.as_view(), name="dashboard-summary"),
 ]
