@@ -403,3 +403,169 @@ class ProjectModelsTestCase(TestCase):
         self.assertEqual(
             len(hier_res.data["participating_departments"][0]["participating_teams"]), 1
         )
+
+    def test_project_member_and_team_assignment_participation(self):
+        """
+        Tests SRS §1.3, §4.3, §5.2, §6.3 Step 6, §25.C Screen 21 & DB Design §1, §4.3, §5:
+        1. Team assignment with auto_add_team_members & sync_team_members enrolls active team roster
+        2. Individual & bulk member assignment with role_in_project + cross-company rejection
+        3. Inline role update (PATCH /api/projects/members/{id}/)
+        4. Protection against removing/deactivating the accountable Project Manager of an Active project
+        5. Soft-remove & reactivate member endpoint (/api/projects/members/{id}/reactivate/)
+        6. Multi-project participation tracking (/api/projects/user_participations/ & ?participating_user=)
+        """
+        from apps.companies.models import CompanyMembership
+        from apps.organization.models import DepartmentMembership, TeamMembership
+        from rest_framework.test import APIClient
+
+        client = APIClient()
+        client.force_authenticate(user=self.user)
+
+        team_lead = User.objects.create_user(
+            email="tl_part@test.com",
+            username="tl_part",
+            full_name="Team Lead Alpha",
+            designation="Lead Developer",
+            password="Password123!",
+        )
+        team_dev1 = User.objects.create_user(
+            email="dev1_part@test.com",
+            username="dev1_part",
+            full_name="Backend Dev One",
+            designation="Senior Engineer",
+            password="Password123!",
+        )
+        team_dev2 = User.objects.create_user(
+            email="dev2_part@test.com",
+            username="dev2_part",
+            full_name="Backend Dev Two",
+            designation="QA Engineer",
+            password="Password123!",
+        )
+        for u in (self.user, team_lead, team_dev1, team_dev2):
+            CompanyMembership.objects.get_or_create(company=self.company, user=u, status="Active")
+            DepartmentMembership.objects.get_or_create(
+                department=self.department,
+                user=u,
+                defaults={"is_head": u == self.user, "start_date": date.today(), "status": "Active"},
+            )
+
+        TeamMembership.objects.create(team=self.team, user=team_lead, is_leader=True, status="Active")
+        TeamMembership.objects.create(team=self.team, user=team_dev1, is_leader=False, status="Active")
+        TeamMembership.objects.create(team=self.team, user=team_dev2, is_leader=False, status="Active")
+
+        project1 = Project.objects.create(
+            company=self.company,
+            project_manager=self.user,
+            name="Core Platform Modernization",
+            code="PRJ-PART-01",
+            status=Project.Status.ACTIVE,
+        )
+        ProjectMember.objects.create(
+            project=project1,
+            user=self.user,
+            role_in_project="Project Manager",
+            status=ProjectMember.Status.ACTIVE,
+        )
+
+        # 1. Map team and sync all active team members into ProjectMember participation
+        res_map = client.post(
+            f"/api/projects/{project1.id}/map_teams/",
+            {
+                "team_ids": [str(self.team.id)],
+                "replace": True,
+                "auto_map_departments": True,
+                "auto_add_leaders": True,
+                "auto_add_team_members": True,
+            },
+            format="json",
+        )
+        self.assertEqual(res_map.status_code, 200, res_map.content)
+        self.assertEqual(
+            ProjectMember.objects.filter(project=project1, status="Active").count(),
+            4,  # PM + Team Lead + 2 Team Members
+        )
+
+        # 2. Reject cross-company user assignment (DB Design §5)
+        ext_company = Company.objects.create(name="External Corp", code="EXT-CORP")
+        ext_user = User.objects.create_user(
+            email="ext@other.com",
+            username="extuser",
+            full_name="External User",
+            password="Password123!",
+        )
+        CompanyMembership.objects.create(company=ext_company, user=ext_user, status="Active")
+        bad_mem_res = client.post(
+            f"/api/projects/{project1.id}/assign_members/",
+            {"members": [{"user": str(ext_user.id), "role_in_project": "Contributor"}]},
+            format="json",
+        )
+        self.assertEqual(bad_mem_res.status_code, 400)
+
+        # 3. Update a member's role inline via PATCH /api/projects/members/{id}/
+        dev1_pm = ProjectMember.objects.get(project=project1, user=team_dev1)
+        patch_role_res = client.patch(
+            f"/api/projects/members/{dev1_pm.id}/",
+            {"role_in_project": "Principal Systems Architect"},
+            format="json",
+        )
+        self.assertEqual(patch_role_res.status_code, 200, patch_role_res.content)
+        self.assertEqual(patch_role_res.data["role_in_project"], "Principal Systems Architect")
+
+        # 4. Accountable Project Manager of Active project cannot be removed without reassigning PM first
+        pm_member = ProjectMember.objects.get(project=project1, user=self.user)
+        del_pm_res = client.delete(f"/api/projects/members/{pm_member.id}/")
+        self.assertEqual(del_pm_res.status_code, 400)
+
+        # 5. Soft-remove regular member & reactivate via /api/projects/members/{id}/reactivate/
+        del_dev1_res = client.delete(f"/api/projects/members/{dev1_pm.id}/")
+        self.assertEqual(del_dev1_res.status_code, 200)
+        self.assertEqual(del_dev1_res.data["status"], "Removed")
+        self.assertIsNotNone(del_dev1_res.data["left_at"])
+
+        reactivate_res = client.post(
+            f"/api/projects/members/{dev1_pm.id}/reactivate/",
+            {"role_in_project": "Senior Backend Specialist"},
+            format="json",
+        )
+        self.assertEqual(reactivate_res.status_code, 200, reactivate_res.content)
+        self.assertEqual(reactivate_res.data["status"], "Active")
+        self.assertIsNone(reactivate_res.data["left_at"])
+        self.assertEqual(reactivate_res.data["role_in_project"], "Senior Backend Specialist")
+
+        # 6. Multi-project participation (SRS §1.3 & §27.1: Employee participates in multiple projects)
+        project2 = Project.objects.create(
+            company=self.company,
+            project_manager=self.user,
+            name="Mobile App Launch",
+            code="PRJ-PART-02",
+            status=Project.Status.ACTIVE,
+        )
+        client.post(
+            f"/api/projects/{project2.id}/assign_members/",
+            {"members": [{"user": str(team_dev1.id), "role_in_project": "API Integration Lead"}]},
+            format="json",
+        )
+
+        # Check user_participations endpoint
+        user_part_res = client.get(f"/api/projects/user_participations/?user={team_dev1.id}")
+        self.assertEqual(user_part_res.status_code, 200)
+        self.assertEqual(len(user_part_res.data), 2)
+
+        # Check ?participating_user=<uuid> filter on /api/projects/
+        filt_res = client.get(f"/api/projects/?participating_user={team_dev1.id}")
+        self.assertEqual(filt_res.status_code, 200)
+        filt_items = filt_res.data["results"] if "results" in filt_res.data else filt_res.data
+        self.assertEqual(len(filt_items), 2)
+
+        # Check /api/projects/{id}/participation/ matrix includes team_members & other_active_projects
+        part_matrix_res = client.get(f"/api/projects/{project1.id}/participation/")
+        self.assertEqual(part_matrix_res.status_code, 200)
+        self.assertEqual(part_matrix_res.data["summary"]["participating_teams_count"], 1)
+        self.assertEqual(part_matrix_res.data["summary"]["active_members_count"], 4)
+        dev1_entry = next(
+            m for m in part_matrix_res.data["members"] if m["user"] == str(team_dev1.id)
+        )
+        self.assertEqual(dev1_entry["other_active_projects_count"], 1)
+        self.assertEqual(dev1_entry["other_active_projects"][0]["code"], "PRJ-PART-02")
+

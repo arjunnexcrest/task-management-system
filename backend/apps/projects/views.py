@@ -1,5 +1,4 @@
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action
@@ -11,6 +10,7 @@ from .filters import ProjectFilterSet, ProjectMilestoneFilterSet, ProjectPhaseFi
 from .models import (
     MilestoneDependency,
     MilestoneTask,
+    Project,
     ProjectDepartment,
     ProjectMember,
     ProjectMilestone,
@@ -36,9 +36,12 @@ from .services import (
     close_project_service,
     delete_project_service,
     get_project_assignment_hierarchy,
+    get_user_project_participations,
     map_project_departments_service,
     map_project_teams_service,
     recalculate_project_progress_service,
+    sync_project_team_members_service,
+    update_project_member_participation_service,
 )
 
 
@@ -57,8 +60,10 @@ class ProjectViewSet(viewsets.ModelViewSet):
         "assign_manager",
         "map_departments",
         "map_teams",
+        "sync_team_members",
         "assign_members",
         "assignment_hierarchy",
+        "participation",
     )
 
     def get_queryset(self):
@@ -135,13 +140,15 @@ class ProjectViewSet(viewsets.ModelViewSet):
     def map_teams(self, request, pk=None):
         """
         SRS §2.4, §5.2 & §6.3 Step 6:
-        Maps participating teams under participating departments and coordinates Team Leaders.
+        Maps participating teams under participating departments, coordinates Team Leaders,
+        and optionally enrolls all active team members into ProjectMember participation.
         """
         project = self.get_object()
         team_ids = request.data.get("team_ids", [])
         replace = bool(request.data.get("replace", True))
         auto_map_departments = bool(request.data.get("auto_map_departments", True))
         auto_add_leaders = bool(request.data.get("auto_add_leaders", True))
+        auto_add_team_members = bool(request.data.get("auto_add_team_members", False))
         try:
             updated = map_project_teams_service(
                 project=project,
@@ -149,12 +156,37 @@ class ProjectViewSet(viewsets.ModelViewSet):
                 replace=replace,
                 auto_map_departments=auto_map_departments,
                 auto_add_leaders=auto_add_leaders,
+                auto_add_team_members=auto_add_team_members,
             )
         except DjangoValidationError as exc:
             msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
             return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
         refreshed = get_project_detail_queryset(request).get(pk=updated.pk)
         return Response(ProjectDetailSerializer(refreshed).data)
+
+    @action(detail=True, methods=["post"])
+    def sync_team_members(self, request, pk=None):
+        """
+        SRS §5.2 & §6.3 Step 6:
+        Enrolls all active members of mapped participating teams (or a specific team_id)
+        into ProjectMember(status='Active') so the team roster has full project participation.
+        """
+        project = self.get_object()
+        team_id = request.data.get("team_id") or request.data.get("team")
+        team_ids = request.data.get("team_ids")
+        try:
+            sync_result = sync_project_team_members_service(
+                project=project,
+                team_id=team_id,
+                team_ids=team_ids,
+            )
+        except DjangoValidationError as exc:
+            msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        refreshed = get_project_detail_queryset(request).get(pk=project.pk)
+        data = ProjectDetailSerializer(refreshed).data
+        data["sync_result"] = sync_result
+        return Response(data)
 
     @action(detail=True, methods=["post"])
     def assign_members(self, request, pk=None):
@@ -182,11 +214,38 @@ class ProjectViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["get"])
     def assignment_hierarchy(self, request, pk=None):
         """
-        Returns the full SRS §6.3 Project Assignment Hierarchy:
+        Returns the full SRS §6.3 Project Assignment Hierarchy & Participation Matrix:
         Company -> Project Manager -> Participating Departments & Heads -> Participating Teams & Leaders -> Members.
         """
         project = self.get_object()
         return Response(get_project_assignment_hierarchy(project=project))
+
+    @action(detail=True, methods=["get"])
+    def participation(self, request, pk=None):
+        """
+        Alias endpoint for Project Participation & Team Roster details (SRS §5.2, §6.3 & §25.C Screen 21).
+        """
+        project = self.get_object()
+        return Response(get_project_assignment_hierarchy(project=project))
+
+    @action(detail=False, methods=["get"])
+    def user_participations(self, request):
+        """
+        SRS §1.3, §3.3, §4.3, §19 & §27.1:
+        Returns all projects in which the specified (or authenticated) employee participates.
+        """
+        user_id = request.query_params.get("user") or (
+            str(request.user.id) if getattr(request.user, "is_authenticated", False) else None
+        )
+        company_id = request.query_params.get("company")
+        if not user_id:
+            return Response(
+                {"error": "Provide ?user=<uuid> or authenticate to view project participations."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(
+            get_user_project_participations(user_id=user_id, company_id=company_id)
+        )
 
     @action(detail=True, methods=["post"])
     def archive(self, request, pk=None):
@@ -243,15 +302,51 @@ class ProjectMemberViewSet(viewsets.ModelViewSet):
         """
         Preserves membership history by marking status='Removed' and setting left_at
         unless ?hard=true is requested (DB Design §1 & §4.3).
+        Protects the accountable Project Manager of an Active project.
         """
         instance = self.get_object()
+        if (
+            instance.project.project_manager_id == instance.user_id
+            and instance.project.status == Project.Status.ACTIVE
+        ):
+            return Response(
+                {
+                    "error": "Cannot remove the accountable Project Manager of an Active project. Reassign the Project Manager first (SRS §1.4 #2 & DB Design §4.3)."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         if request.query_params.get("hard", "").lower() in ("true", "1", "yes"):
             instance.delete()
             return Response(status=status.HTTP_204_NO_CONTENT)
-        instance.status = ProjectMember.Status.REMOVED
-        instance.left_at = timezone.now()
-        instance.save(update_fields=["status", "left_at"])
-        return Response(ProjectMemberSerializer(instance).data, status=status.HTTP_200_OK)
+
+        try:
+            updated = update_project_member_participation_service(
+                member=instance,
+                status_val=ProjectMember.Status.REMOVED,
+            )
+        except DjangoValidationError as exc:
+            msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(ProjectMemberSerializer(updated).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"])
+    def reactivate(self, request, pk=None):
+        """
+        Reactivates a Removed or Inactive ProjectMember record (status='Active', left_at=None).
+        """
+        instance = self.get_object()
+        role = request.data.get("role_in_project")
+        try:
+            updated = update_project_member_participation_service(
+                member=instance,
+                role_in_project=role,
+                status_val=ProjectMember.Status.ACTIVE,
+            )
+        except DjangoValidationError as exc:
+            msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(ProjectMemberSerializer(updated).data, status=status.HTTP_200_OK)
 
 
 class ProjectDepartmentViewSet(viewsets.ModelViewSet):
@@ -298,10 +393,7 @@ class ProjectMilestoneViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         qs = (
             ProjectMilestone.objects.select_related("project", "owner")
-            .prefetch_related(
-                "milestone_tasks__task",
-                "dependencies__depends_on_milestone",
-            )
+            .prefetch_related("milestone_tasks__task", "dependencies__depends_on_milestone")
             .all()
         )
         return scope_queryset_by_company(qs, self.request, company_lookup="project__company_id")
@@ -314,7 +406,7 @@ class MilestoneTaskViewSet(viewsets.ModelViewSet):
     filterset_fields = ["milestone", "task"]
 
     def get_queryset(self):
-        qs = MilestoneTask.objects.select_related("milestone", "milestone__project", "task").all()
+        qs = MilestoneTask.objects.select_related("milestone__project", "task").all()
         return scope_queryset_by_company(qs, self.request, company_lookup="milestone__project__company_id")
 
 
@@ -325,7 +417,5 @@ class MilestoneDependencyViewSet(viewsets.ModelViewSet):
     filterset_fields = ["milestone", "depends_on_milestone"]
 
     def get_queryset(self):
-        qs = MilestoneDependency.objects.select_related(
-            "milestone", "milestone__project", "depends_on_milestone"
-        ).all()
+        qs = MilestoneDependency.objects.select_related("milestone__project", "depends_on_milestone").all()
         return scope_queryset_by_company(qs, self.request, company_lookup="milestone__project__company_id")

@@ -1,8 +1,10 @@
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.utils import timezone
 from rest_framework import serializers
 from apps.accounts.models import User
 from apps.common.serializers import CompanyScopedValidationMixin
+from apps.notifications.models import Notification
 from apps.organization.models import Department, DepartmentMembership, Team, TeamMembership
 from .models import (
     MilestoneDependency,
@@ -19,6 +21,8 @@ from .services import (
     assign_project_members_service,
     map_project_departments_service,
     map_project_teams_service,
+    sync_project_team_members_service,
+    update_project_member_participation_service,
 )
 
 
@@ -27,6 +31,10 @@ class ProjectMemberSerializer(CompanyScopedValidationMixin, serializers.ModelSer
     user_email = serializers.CharField(source="user.email", read_only=True)
     user_designation = serializers.CharField(source="user.designation", read_only=True, default=None)
     user_employee_id = serializers.CharField(source="user.employee_id", read_only=True)
+    is_project_manager = serializers.SerializerMethodField()
+    department_name = serializers.SerializerMethodField()
+    team_names = serializers.SerializerMethodField()
+    owned_tasks_count = serializers.SerializerMethodField()
 
     class Meta:
         model = ProjectMember
@@ -38,6 +46,10 @@ class ProjectMemberSerializer(CompanyScopedValidationMixin, serializers.ModelSer
             "user_email",
             "user_designation",
             "user_employee_id",
+            "is_project_manager",
+            "department_name",
+            "team_names",
+            "owned_tasks_count",
             "role_in_project",
             "status",
             "joined_at",
@@ -60,12 +72,74 @@ class ProjectMemberSerializer(CompanyScopedValidationMixin, serializers.ModelSer
         role = validated_data.get("role_in_project") or "Team Member"
         existing = ProjectMember.objects.filter(project=project, user=user).first()
         if existing:
+            was_inactive = existing.status != ProjectMember.Status.ACTIVE
             existing.role_in_project = role
             existing.status = ProjectMember.Status.ACTIVE
             existing.left_at = None
             existing.save(update_fields=["role_in_project", "status", "left_at"])
+            if was_inactive:
+                Notification.objects.create(
+                    user=user,
+                    notification_type="PROJECT_MEMBER_ASSIGNED",
+                    title=f"Project Participation Reactivated: {project.code}",
+                    message=f"Your participation in project '{project.name}' is now Active as {role}.",
+                    related_project=project,
+                )
             return existing
-        return super().create(validated_data)
+        instance = super().create(validated_data)
+        Notification.objects.create(
+            user=user,
+            notification_type="PROJECT_MEMBER_ASSIGNED",
+            title=f"Assigned to Project: {project.code}",
+            message=f"You have been assigned to project '{project.name}' as {instance.role_in_project or 'Team Member'}.",
+            related_project=project,
+        )
+        return instance
+
+    def update(self, instance, validated_data):
+        role = validated_data.get("role_in_project")
+        status_val = validated_data.get("status")
+        try:
+            return update_project_member_participation_service(
+                member=instance,
+                role_in_project=role,
+                status_val=status_val,
+            )
+        except DjangoValidationError as exc:
+            msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
+            raise serializers.ValidationError({"detail": msg})
+
+    def get_is_project_manager(self, obj):
+        return bool(obj.project and obj.project.project_manager_id == obj.user_id)
+
+    def get_department_name(self, obj):
+        if not obj.project_id:
+            return None
+        dm = (
+            DepartmentMembership.objects.filter(
+                user_id=obj.user_id,
+                department__company_id=obj.project.company_id,
+                status=DepartmentMembership.Status.ACTIVE,
+            )
+            .select_related("department")
+            .first()
+        )
+        return dm.department.name if dm else None
+
+    def get_team_names(self, obj):
+        if not obj.project_id:
+            return []
+        tms = TeamMembership.objects.filter(
+            user_id=obj.user_id,
+            team__department__company_id=obj.project.company_id,
+            status=TeamMembership.Status.ACTIVE,
+        ).select_related("team")
+        return [tm.team.name for tm in tms]
+
+    def get_owned_tasks_count(self, obj):
+        if not obj.project_id:
+            return 0
+        return obj.project.tasks.filter(task_owner_id=obj.user_id).count()
 
 
 class ProjectDepartmentSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
@@ -151,6 +225,14 @@ class ProjectTeamSerializer(CompanyScopedValidationMixin, serializers.ModelSeria
     department_name = serializers.CharField(source="team.department.name", read_only=True)
     team_leader_id = serializers.SerializerMethodField()
     team_leader_name = serializers.SerializerMethodField()
+    active_members_count = serializers.SerializerMethodField()
+    participating_members_count = serializers.SerializerMethodField()
+    auto_add_team_members = serializers.BooleanField(
+        required=False,
+        default=False,
+        write_only=True,
+        help_text="When true, automatically enrolls all active members of this team as ProjectMember participants.",
+    )
 
     class Meta:
         model = ProjectTeam
@@ -164,9 +246,13 @@ class ProjectTeamSerializer(CompanyScopedValidationMixin, serializers.ModelSeria
             "department_name",
             "team_leader_id",
             "team_leader_name",
+            "active_members_count",
+            "participating_members_count",
+            "auto_add_team_members",
             "created_at",
         ]
         read_only_fields = ["id", "created_at"]
+        validators = []
 
     def validate(self, attrs):
         project = attrs.get("project") or getattr(self.instance, "project", None)
@@ -177,11 +263,12 @@ class ProjectTeamSerializer(CompanyScopedValidationMixin, serializers.ModelSeria
 
     @transaction.atomic
     def create(self, validated_data):
+        auto_add_members = bool(validated_data.pop("auto_add_team_members", False))
         project = validated_data["project"]
         team = validated_data["team"]
         # Ensure team's department is a participating department (DB Design §4.3)
         ProjectDepartment.objects.get_or_create(project=project, department_id=team.department_id)
-        instance = super().create(validated_data)
+        instance, _ = ProjectTeam.objects.get_or_create(project=project, team=team)
         leader_mem = (
             TeamMembership.objects.filter(
                 team=team,
@@ -192,14 +279,21 @@ class ProjectTeamSerializer(CompanyScopedValidationMixin, serializers.ModelSeria
             .first()
         )
         if leader_mem:
-            ProjectMember.objects.get_or_create(
-                project=project,
-                user=leader_mem.user,
-                defaults={
-                    "role_in_project": f"Team Leader ({team.name})",
-                    "status": ProjectMember.Status.ACTIVE,
-                },
-            )
+            existing_pm = ProjectMember.objects.filter(project=project, user=leader_mem.user).first()
+            if existing_pm:
+                if existing_pm.status != ProjectMember.Status.ACTIVE:
+                    existing_pm.status = ProjectMember.Status.ACTIVE
+                    existing_pm.left_at = None
+                    existing_pm.save(update_fields=["status", "left_at"])
+            else:
+                ProjectMember.objects.create(
+                    project=project,
+                    user=leader_mem.user,
+                    role_in_project=f"Team Leader ({team.name})",
+                    status=ProjectMember.Status.ACTIVE,
+                )
+        if auto_add_members:
+            sync_project_team_members_service(project=project, team_id=team.id)
         return instance
 
     def _get_leader(self, obj):
@@ -220,6 +314,23 @@ class ProjectTeamSerializer(CompanyScopedValidationMixin, serializers.ModelSeria
     def get_team_leader_name(self, obj):
         lm = self._get_leader(obj)
         return lm.user.full_name if lm else None
+
+    def get_active_members_count(self, obj):
+        return TeamMembership.objects.filter(
+            team_id=obj.team_id,
+            status=TeamMembership.Status.ACTIVE,
+        ).count()
+
+    def get_participating_members_count(self, obj):
+        team_user_ids = TeamMembership.objects.filter(
+            team_id=obj.team_id,
+            status=TeamMembership.Status.ACTIVE,
+        ).values_list("user_id", flat=True)
+        return ProjectMember.objects.filter(
+            project_id=obj.project_id,
+            user_id__in=team_user_ids,
+            status=ProjectMember.Status.ACTIVE,
+        ).count()
 
 
 class ProjectPhaseSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
