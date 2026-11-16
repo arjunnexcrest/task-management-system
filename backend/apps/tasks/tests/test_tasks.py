@@ -276,3 +276,106 @@ class APIStructureAndSerializersTestCase(APITestCase):
         dash_res = self.client.get(f"/api/dashboards/summary/?company={self.company_a.id}")
         self.assertEqual(dash_res.status_code, 200)
         self.assertEqual(dash_res.data["projects"]["total_projects"], 1)
+
+    def test_task_crud_create_read_update_delete_api(self):
+        """
+        End-to-end test for SRS §7.1–§7.11 Task & Subtask Create, Read/Filter, Update/Edit, and Delete APIs.
+        """
+        self.client.force_authenticate(user=self.user_a)
+
+        dev2 = User.objects.create_user(
+            email="dev2@companya.com",
+            username="dev2_a",
+            full_name="Dev Two A",
+            password="Password123!",
+        )
+        CompanyMembership.objects.create(company=self.company_a, user=dev2, status="Active")
+        team_a = Team.objects.create(department=self.dept_a, name="API Team A", code="APIA")
+
+        # 1. CREATE Task with full SRS §7.1 fields + assignees + tags + initial checklist
+        create_res = self.client.post(
+            "/api/tasks/",
+            {
+                "project": str(self.project_a.id),
+                "department": str(self.dept_a.id),
+                "team": str(team_a.id),
+                "title": "Build OAuth2 Token Service",
+                "description": "Implement JWT rotation and revocation endpoints.",
+                "task_owner": str(self.user_a.id),
+                "reviewer": str(dev2.id),
+                "priority": "Critical",
+                "status": "To Do",
+                "start_date": "2026-11-01",
+                "due_date": "2026-11-10",
+                "estimated_effort": "24.50",
+                "approval_required": True,
+                "assignee_user_ids": [str(self.user_a.id)],
+                "assignee_team_ids": [str(team_a.id)],
+                "tag_names": ["security", "oauth2", "backend"],
+                "initial_checklist_items": ["Define token model", "Add refresh endpoint"],
+            },
+            format="json",
+        )
+        self.assertEqual(create_res.status_code, 201, create_res.content)
+        task_id = create_res.data["id"]
+        self.assertEqual(create_res.data["title"], "Build OAuth2 Token Service")
+        self.assertEqual(create_res.data["status"], "Assigned")  # auto-transitioned from To Do upon assignment
+        self.assertEqual(len(create_res.data["assignee_user_ids"]), 1)
+        self.assertEqual(len(create_res.data["assignee_team_ids"]), 1)
+        self.assertEqual(set(create_res.data["tag_names"]), {"security", "oauth2", "backend"})
+
+        # 2. CREATE Subtask under parent_task
+        sub_res = self.client.post(
+            "/api/tasks/",
+            {
+                "project": str(self.project_a.id),
+                "parent_task": task_id,
+                "title": "Write OAuth2 Unit Tests",
+                "priority": "High",
+                "assignee_user_ids": [str(dev2.id)],
+            },
+            format="json",
+        )
+        self.assertEqual(sub_res.status_code, 201, sub_res.content)
+        subtask_id = sub_res.data["id"]
+        self.assertTrue(sub_res.data["is_subtask"])
+        self.assertEqual(sub_res.data["parent_task_title"], "Build OAuth2 Token Service")
+
+        # 3. READ & FILTER Task List (SRS §7.11)
+        list_res = self.client.get(
+            f"/api/tasks/?company={self.company_a.id}&tag=oauth2&is_subtask=false"
+        )
+        self.assertEqual(list_res.status_code, 200)
+        items = list_res.data["results"] if "results" in list_res.data else list_res.data
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["id"], task_id)
+
+        # 4. UPDATE / EDIT Task (PATCH /api/tasks/{id}/) including assignee reassignment & tags
+        patch_res = self.client.patch(
+            f"/api/tasks/{task_id}/",
+            {
+                "title": "Build OAuth2 Token Service v2",
+                "priority": "High",
+                "estimated_effort": "30.00",
+                "assignee_user_ids": [str(dev2.id)],  # reassigns from user_a to dev2
+                "tag_names": ["security", "v2"],
+            },
+            format="json",
+        )
+        self.assertEqual(patch_res.status_code, 200, patch_res.content)
+        self.assertEqual(patch_res.data["title"], "Build OAuth2 Token Service v2")
+        self.assertEqual(patch_res.data["assignee_user_ids"], [str(dev2.id)])
+        self.assertEqual(set(patch_res.data["tag_names"]), {"security", "v2"})
+        # Previous assignment for user_a is preserved as 'Reassigned' (DB Design §4.4 & §5)
+        self.assertTrue(
+            TaskAssignment.objects.filter(
+                task_id=task_id, user=self.user_a, status=TaskAssignment.Status.REASSIGNED
+            ).exists()
+        )
+
+        # 5. DELETE Task (DELETE /api/tasks/{id}/) cleanly removes task, subtasks & protected records
+        del_res = self.client.delete(f"/api/tasks/{task_id}/")
+        self.assertEqual(del_res.status_code, 204)
+        self.assertFalse(Task.objects.filter(id=task_id).exists())
+        self.assertFalse(Task.objects.filter(id=subtask_id).exists())
+

@@ -1,6 +1,9 @@
+from django.db import transaction
 from django.utils import timezone
 from rest_framework import serializers
+from apps.accounts.models import User
 from apps.common.serializers import CompanyScopedValidationMixin
+from apps.organization.models import Team
 from .models import (
     Attachment,
     Checklist,
@@ -15,6 +18,7 @@ from .models import (
     TaskTag,
     TaskTagAssignment,
 )
+from .services import sync_task_associations_service
 
 ALLOWED_ATTACHMENT_MIME_PREFIXES = (
     "application/pdf",
@@ -323,8 +327,12 @@ class SubtaskNestedSerializer(serializers.ModelSerializer):
 
 
 class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
+    company_id = serializers.UUIDField(source="project.company_id", read_only=True)
+    company_name = serializers.CharField(source="project.company.name", read_only=True)
+    company_code = serializers.CharField(source="project.company.code", read_only=True)
     project_name = serializers.CharField(source="project.name", read_only=True)
     project_code = serializers.CharField(source="project.code", read_only=True)
+    parent_task_title = serializers.CharField(source="parent_task.title", read_only=True, default=None)
     phase_name = serializers.CharField(source="phase.name", read_only=True, default=None)
     department_name = serializers.CharField(source="department.name", read_only=True, default=None)
     team_name = serializers.CharField(source="team.name", read_only=True, default=None)
@@ -334,17 +342,54 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
     is_subtask = serializers.BooleanField(read_only=True)
     is_overdue = serializers.SerializerMethodField()
     subtasks_count = serializers.SerializerMethodField()
+    actual_effort_hours = serializers.SerializerMethodField()
     active_assignments = serializers.SerializerMethodField()
     tags = serializers.SerializerMethodField()
+
+    # SRS §7.1 Write/Read Associations for Task Creation & Editing
+    assignee_user_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        write_only=True,
+        help_text="List of User UUIDs assigned to this task.",
+    )
+    assignee_team_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        write_only=True,
+        help_text="List of Team UUIDs assigned to this task.",
+    )
+    tag_names = serializers.ListField(
+        child=serializers.CharField(max_length=80),
+        required=False,
+        write_only=True,
+        help_text="List of classification tag names for this task.",
+    )
+    dependency_task_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        write_only=True,
+        help_text="List of prerequisite Task UUIDs within the same project.",
+    )
+    initial_checklist_items = serializers.ListField(
+        child=serializers.CharField(max_length=250),
+        required=False,
+        write_only=True,
+        help_text="Optional list of checklist item titles to create with the task.",
+    )
 
     class Meta:
         model = Task
         fields = [
             "id",
+            "company_id",
+            "company_name",
+            "company_code",
             "project",
             "project_name",
             "project_code",
             "parent_task",
+            "parent_task_title",
             "is_subtask",
             "phase",
             "phase_name",
@@ -365,6 +410,7 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
             "start_date",
             "due_date",
             "estimated_effort",
+            "actual_effort_hours",
             "progress",
             "progress_method",
             "approval_required",
@@ -372,6 +418,11 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
             "subtasks_count",
             "active_assignments",
             "tags",
+            "assignee_user_ids",
+            "assignee_team_ids",
+            "tag_names",
+            "dependency_task_ids",
+            "initial_checklist_items",
             "created_at",
             "updated_at",
             "completed_at",
@@ -413,6 +464,11 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
             if "due_date" in attrs
             else getattr(self.instance, "due_date", None)
         )
+        progress_val = attrs.get("progress")
+        if progress_val is not None and (float(progress_val) < 0 or float(progress_val) > 100):
+            raise serializers.ValidationError(
+                {"progress": "Task progress percentage must be between 0 and 100 (DB Design §5)."}
+            )
 
         if project:
             company = project.company
@@ -423,6 +479,16 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
                     raise serializers.ValidationError(
                         {"parent_task": "Parent task and subtask must belong to the same project (DB Design §5)."}
                     )
+                # Prevent circular parent_task chain
+                if self.instance:
+                    anc = parent_task
+                    while anc:
+                        if anc.id == self.instance.id:
+                            raise serializers.ValidationError(
+                                {"parent_task": "Circular parent-subtask relationship detected."}
+                            )
+                        anc = anc.parent_task
+
             if phase and phase.project_id != project.id:
                 raise serializers.ValidationError(
                     {"phase": "Selected phase does not belong to the task's project."}
@@ -436,10 +502,113 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
             if reviewer:
                 self.validate_user_in_company(reviewer, company, field_label="Reviewer")
 
+            # Validate assignee_user_ids belong to the project's company
+            if "assignee_user_ids" in attrs and attrs["assignee_user_ids"]:
+                for u_obj in User.objects.filter(id__in=attrs["assignee_user_ids"]):
+                    self.validate_user_in_company(u_obj, company, field_label="Assignee user")
+
+            # Validate assignee_team_ids belong to the project's company
+            if "assignee_team_ids" in attrs and attrs["assignee_team_ids"]:
+                for t_obj in Team.objects.filter(id__in=attrs["assignee_team_ids"]):
+                    self.validate_team_in_company(t_obj, company)
+
+            # Validate dependency_task_ids belong to the same project and do not form cycles
+            if "dependency_task_ids" in attrs and attrs["dependency_task_ids"]:
+                dep_ids = set(attrs["dependency_task_ids"])
+                if self.instance and self.instance.id in dep_ids:
+                    raise serializers.ValidationError(
+                        {"dependency_task_ids": "A task cannot depend on itself (DB Design §5)."}
+                    )
+                dep_tasks = list(Task.objects.filter(id__in=dep_ids))
+                if len(dep_tasks) != len(dep_ids):
+                    raise serializers.ValidationError(
+                        {"dependency_task_ids": "One or more prerequisite tasks do not exist."}
+                    )
+                for dt in dep_tasks:
+                    if dt.project_id != project.id:
+                        raise serializers.ValidationError(
+                            {"dependency_task_ids": "All prerequisite tasks must belong to the same project (DB Design §5)."}
+                        )
+                    if self.instance:
+                        visited = {self.instance.id}
+                        queue = [dt.id]
+                        while queue:
+                            curr = queue.pop(0)
+                            if curr in visited:
+                                raise serializers.ValidationError(
+                                    {"dependency_task_ids": "Circular task dependency detected (DB Design §5)."}
+                                )
+                            visited.add(curr)
+                            prereqs = TaskDependency.objects.filter(task_id=curr).values_list(
+                                "depends_on_task_id", flat=True
+                            )
+                            queue.extend(prereqs)
+
         if start_date and due_date and due_date < start_date:
             raise serializers.ValidationError({"due_date": "Due date cannot be earlier than start date."})
 
         return attrs
+
+    def _extract_association_fields(self, validated_data):
+        return {
+            "assignee_user_ids": validated_data.pop("assignee_user_ids", None),
+            "assignee_team_ids": validated_data.pop("assignee_team_ids", None),
+            "tag_names": validated_data.pop("tag_names", None),
+            "dependency_task_ids": validated_data.pop("dependency_task_ids", None),
+            "initial_checklist_items": validated_data.pop("initial_checklist_items", None),
+        }
+
+    @transaction.atomic
+    def create(self, validated_data):
+        assoc = self._extract_association_fields(validated_data)
+        # Auto-assign task_owner from first assignee_user_id if task_owner not explicitly provided
+        if not validated_data.get("task_owner") and assoc["assignee_user_ids"]:
+            validated_data["task_owner_id"] = assoc["assignee_user_ids"][0]
+
+        task = super().create(validated_data)
+        sync_task_associations_service(
+            task=task,
+            actor_id=task.created_by_id,
+            **assoc,
+        )
+        from apps.projects.services import recalculate_project_progress_service
+
+        recalculate_project_progress_service(project=task.project)
+        task.refresh_from_db()
+        return task
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        assoc = self._extract_association_fields(validated_data)
+        assoc.pop("initial_checklist_items", None)
+        task = super().update(instance, validated_data)
+        sync_task_associations_service(
+            task=task,
+            actor_id=task.created_by_id,
+            **assoc,
+        )
+        from apps.projects.services import recalculate_project_progress_service
+
+        recalculate_project_progress_service(project=task.project)
+        task.refresh_from_db()
+        return task
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        active_assigns = [
+            a for a in instance.assignments.all() if a.status in ("Active", "Acknowledged")
+        ]
+        data["assignee_user_ids"] = [
+            str(a.user_id) for a in active_assigns if a.assignment_type == "User" and a.user_id
+        ]
+        data["assignee_team_ids"] = [
+            str(a.team_id) for a in active_assigns if a.assignment_type == "Team" and a.team_id
+        ]
+        data["tag_names"] = [ta.tag.name for ta in instance.tag_assignments.all()]
+        data["dependency_task_ids"] = [
+            str(dep.depends_on_task_id) for dep in instance.dependencies.all()
+        ]
+        return data
 
     def get_is_overdue(self, obj):
         if obj.due_date and obj.status not in [Task.Status.COMPLETED, Task.Status.CANCELLED]:
@@ -450,6 +619,12 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
         if hasattr(obj, "annotated_subtasks_count"):
             return obj.annotated_subtasks_count
         return obj.subtasks.count()
+
+    def get_actual_effort_hours(self, obj):
+        total_mins = sum(
+            te.duration_minutes or 0 for te in obj.time_entries.all()
+        )
+        return round(total_mins / 60.0, 2)
 
     def get_active_assignments(self, obj):
         assignments = [

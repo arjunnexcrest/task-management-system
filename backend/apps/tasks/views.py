@@ -40,7 +40,7 @@ from .serializers import (
     TaskTagAssignmentSerializer,
     TaskTagSerializer,
 )
-from .services import assign_task_service, transition_task_status_service
+from .services import assign_task_service, delete_task_service, transition_task_status_service
 
 
 def _default_user(request):
@@ -71,6 +71,15 @@ class TaskViewSet(viewsets.ModelViewSet):
             serializer.save(created_by=_default_user(self.request))
         else:
             serializer.save()
+
+    def destroy(self, request, *args, **kwargs):
+        task = self.get_object()
+        try:
+            delete_task_service(task=task)
+        except DjangoValidationError as exc:
+            msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=["post"])
     def assign(self, request, pk=None):
