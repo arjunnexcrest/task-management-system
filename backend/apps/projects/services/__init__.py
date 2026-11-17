@@ -1,3 +1,4 @@
+from datetime import date
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
@@ -149,7 +150,7 @@ def map_project_departments_service(
                 if hm.user_id == project.project_manager_id
                 else f"Department Head ({hm.department.name})"
             )
-            pm_obj, created = ProjectMember.objects.update_or_create(
+            ProjectMember.objects.update_or_create(
                 project=project,
                 user=hm.user,
                 defaults={
@@ -178,11 +179,13 @@ def map_project_teams_service(
     replace: bool = True,
     auto_map_departments: bool = True,
     auto_add_leaders: bool = True,
+    auto_add_team_members: bool = False,
 ) -> Project:
     """
     SRS §2.4, §5.2 & §6.3 Step 6 & DB Design §4.3:
     Maps participating teams to a project, ensures each team belongs to a participating
-    company/department, and coordinates Team Leaders in ProjectMember.
+    company/department, coordinates Team Leaders in ProjectMember, and optionally
+    onboards all active team members into ProjectMember participation.
     """
     unique_team_ids = {str(t_id) for t_id in (team_ids or []) if t_id}
     teams = []
@@ -225,7 +228,8 @@ def map_project_teams_service(
         str(t_id)
         for t_id in ProjectTeam.objects.filter(project=project).values_list("team_id", flat=True)
     }
-    for t_id in unique_team_ids - existing_team_ids:
+    newly_added_team_ids = unique_team_ids - existing_team_ids
+    for t_id in newly_added_team_ids:
         ProjectTeam.objects.create(project=project, team_id=t_id)
 
     # Coordinate Team Leaders (SRS §2.5, §5.2 & §6.3 Step 6)
@@ -237,6 +241,7 @@ def map_project_teams_service(
         ).select_related("user", "team")
         for lm in leader_memberships:
             existing_pm = ProjectMember.objects.filter(project=project, user=lm.user).first()
+            was_inactive = not existing_pm or existing_pm.status != ProjectMember.Status.ACTIVE
             if existing_pm:
                 if existing_pm.status != ProjectMember.Status.ACTIVE:
                     existing_pm.status = ProjectMember.Status.ACTIVE
@@ -249,8 +254,108 @@ def map_project_teams_service(
                     role_in_project=f"Team Leader ({lm.team.name})",
                     status=ProjectMember.Status.ACTIVE,
                 )
+            if was_inactive or str(lm.team_id) in newly_added_team_ids:
+                Notification.objects.create(
+                    user=lm.user,
+                    notification_type="PROJECT_TEAM_ASSIGNED",
+                    title=f"Team Assigned to Project: {project.code}",
+                    message=f"Your team '{lm.team.name}' has been assigned to project '{project.name}'.",
+                    related_project=project,
+                )
+
+    # Optionally enroll all active members of mapped teams into ProjectMember participation
+    if auto_add_team_members and unique_team_ids:
+        sync_project_team_members_service(project=project, team_ids=list(unique_team_ids))
 
     return project
+
+
+@transaction.atomic
+def sync_project_team_members_service(
+    *,
+    project: Project,
+    team_id=None,
+    team_ids: list | None = None,
+) -> dict:
+    """
+    SRS §5.2, §6.3 Step 6 & DB Design §4.3:
+    Enrolls all active members (TeamMembership.status == 'Active') of the project's
+    participating teams (or a specific participating team) into ProjectMember(status='Active').
+    Reactivates historical members while preserving their role or assigning a default team role.
+    """
+    mapped_team_ids = set(
+        str(tid)
+        for tid in ProjectTeam.objects.filter(project=project).values_list("team_id", flat=True)
+    )
+    if team_id:
+        target_ids = {str(team_id)}
+        if not target_ids.issubset(mapped_team_ids):
+            raise ValidationError("Selected team is not mapped as a participating team on this project.")
+    elif team_ids:
+        target_ids = {str(tid) for tid in team_ids if tid}
+    else:
+        target_ids = mapped_team_ids
+
+    if not target_ids:
+        return {"synced_count": 0, "newly_added_count": 0, "reactivated_count": 0, "team_ids": []}
+
+    memberships = list(
+        TeamMembership.objects.filter(
+            team_id__in=target_ids,
+            status=TeamMembership.Status.ACTIVE,
+        ).select_related("user", "team")
+    )
+
+    newly_added = 0
+    reactivated = 0
+    for tm in memberships:
+        default_role = (
+            "Project Manager"
+            if tm.user_id == project.project_manager_id
+            else (
+                f"Team Leader ({tm.team.name})"
+                if tm.is_leader
+                else f"Team Member ({tm.team.name})"
+            )
+        )
+        existing = ProjectMember.objects.filter(project=project, user=tm.user).first()
+        if existing:
+            if existing.status != ProjectMember.Status.ACTIVE:
+                existing.status = ProjectMember.Status.ACTIVE
+                existing.left_at = None
+                if not existing.role_in_project:
+                    existing.role_in_project = default_role
+                existing.save(update_fields=["status", "left_at", "role_in_project"])
+                reactivated += 1
+                Notification.objects.create(
+                    user=tm.user,
+                    notification_type="PROJECT_MEMBER_ASSIGNED",
+                    title=f"Reactivated on Project: {project.code}",
+                    message=f"You have been reactivated on project '{project.name}' via team '{tm.team.name}'.",
+                    related_project=project,
+                )
+        else:
+            ProjectMember.objects.create(
+                project=project,
+                user=tm.user,
+                role_in_project=default_role,
+                status=ProjectMember.Status.ACTIVE,
+            )
+            newly_added += 1
+            Notification.objects.create(
+                user=tm.user,
+                notification_type="PROJECT_MEMBER_ASSIGNED",
+                title=f"Added to Project Team: {project.code}",
+                message=f"You have been added to project '{project.name}' as {default_role}.",
+                related_project=project,
+            )
+
+    return {
+        "synced_count": len(memberships),
+        "newly_added_count": newly_added,
+        "reactivated_count": reactivated,
+        "team_ids": list(target_ids),
+    }
 
 
 @transaction.atomic
@@ -303,6 +408,7 @@ def assign_project_members_service(
     for uid_str, role in normalized.items():
         existing = ProjectMember.objects.filter(project=project, user_id=uid_str).first()
         if existing:
+            was_inactive = existing.status != ProjectMember.Status.ACTIVE
             keep_pm_role = (
                 str(project.project_manager_id) == uid_str
                 and existing.role_in_project == "Project Manager"
@@ -312,6 +418,14 @@ def assign_project_members_service(
             existing.status = ProjectMember.Status.ACTIVE
             existing.left_at = None
             existing.save(update_fields=["role_in_project", "status", "left_at"])
+            if was_inactive:
+                Notification.objects.create(
+                    user_id=uid_str,
+                    notification_type="PROJECT_MEMBER_ASSIGNED",
+                    title=f"Project Participation Reactivated: {project.code}",
+                    message=f"Your participation in project '{project.name}' ({project.code}) is now Active as {new_role}.",
+                    related_project=project,
+                )
         else:
             ProjectMember.objects.create(
                 project=project,
@@ -319,78 +433,245 @@ def assign_project_members_service(
                 role_in_project=role,
                 status=ProjectMember.Status.ACTIVE,
             )
+            Notification.objects.create(
+                user_id=uid_str,
+                notification_type="PROJECT_MEMBER_ASSIGNED",
+                title=f"Assigned to Project: {project.code}",
+                message=f"You have been assigned to project '{project.name}' ({project.code}) as {role}.",
+                related_project=project,
+            )
 
     return project
 
 
+@transaction.atomic
+def update_project_member_participation_service(
+    *,
+    member: ProjectMember,
+    role_in_project: str | None = None,
+    status_val: str | None = None,
+) -> ProjectMember:
+    """
+    SRS §6.3 Step 6 & DB Design §1, §4.3:
+    Updates a project member's role_in_project or participation status ('Active', 'Removed', 'Inactive')
+    while protecting the accountable Project Manager and preserving historical timestamps.
+    """
+    project = member.project
+    update_fields = []
+
+    if status_val and status_val != member.status:
+        if status_val not in (
+            ProjectMember.Status.ACTIVE,
+            ProjectMember.Status.REMOVED,
+            ProjectMember.Status.INACTIVE,
+        ):
+            raise ValidationError(f"Invalid project member status '{status_val}'.")
+
+        if (
+            status_val in (ProjectMember.Status.REMOVED, ProjectMember.Status.INACTIVE)
+            and project.project_manager_id == member.user_id
+            and project.status == Project.Status.ACTIVE
+        ):
+            raise ValidationError(
+                "Cannot remove or deactivate the accountable Project Manager of an Active project. Reassign the Project Manager first (SRS §1.4 #2 & DB Design §4.3)."
+            )
+
+        member.status = status_val
+        update_fields.append("status")
+        if status_val == ProjectMember.Status.ACTIVE:
+            member.left_at = None
+        else:
+            member.left_at = timezone.now()
+        update_fields.append("left_at")
+
+    if role_in_project is not None:
+        cleaned_role = role_in_project.strip() or "Team Member"
+        if (
+            project.project_manager_id == member.user_id
+            and project.status == Project.Status.ACTIVE
+            and cleaned_role != "Project Manager"
+        ):
+            # Keep PM accountable role clear
+            cleaned_role = f"Project Manager ({cleaned_role})" if "Project Manager" not in cleaned_role else cleaned_role
+        member.role_in_project = cleaned_role
+        update_fields.append("role_in_project")
+
+    if update_fields:
+        member.save(update_fields=update_fields)
+
+    return member
+
+
 def get_project_assignment_hierarchy(*, project: Project) -> dict:
     """
-    Returns the complete SRS §6.3 Project Assignment Hierarchy:
+    Returns the complete SRS §6.3 Project Assignment Hierarchy & Participation Matrix:
     Company -> Project Manager -> Participating Departments (with Department Heads) ->
-    Participating Teams (with Team Leaders & Members) -> Project Members & Task Counts.
+    Participating Teams (with Team Leaders & Team Member Roster) -> Project Members, Workload & Multi-Project Participation.
     """
+    from apps.tasks.models import TaskAssignment
+
+    today = date.today()
     all_tasks = list(project.tasks.select_related("department", "team", "task_owner").all())
     top_tasks = [t for t in all_tasks if t.parent_task_id is None]
+    task_ids = [t.id for t in all_tasks]
 
-    # Department heads lookup
-    dept_ids = [pd.department_id for pd in project.project_departments.all()]
-    head_map = {}
-    if dept_ids:
-        for dm in DepartmentMembership.objects.filter(
-            department_id__in=dept_ids,
-            is_head=True,
+    # Active task assignments in this project by user_id
+    assigned_task_ids_by_user: dict[str, set] = {}
+    if task_ids:
+        for ta in TaskAssignment.objects.filter(
+            task_id__in=task_ids,
+            status="Active",
+            user_id__isnull=False,
+        ).values("user_id", "task_id"):
+            uid_s = str(ta["user_id"])
+            assigned_task_ids_by_user.setdefault(uid_s, set()).add(ta["task_id"])
+
+    for t in all_tasks:
+        if t.task_owner_id:
+            uid_s = str(t.task_owner_id)
+            assigned_task_ids_by_user.setdefault(uid_s, set()).add(t.id)
+
+    task_by_id = {t.id: t for t in all_tasks}
+
+    # Current project members map by user_id
+    project_members_qs = list(project.members.select_related("user").all())
+    pm_by_user_id = {str(pm.user_id): pm for pm in project_members_qs}
+
+    # Department heads and user department memberships within the project's company
+    company_dept_memberships = list(
+        DepartmentMembership.objects.filter(
+            department__company_id=project.company_id,
             status=DepartmentMembership.Status.ACTIVE,
-        ).select_related("user"):
+        ).select_related("user", "department")
+    )
+    head_map = {}
+    user_dept_map: dict[str, dict] = {}
+    for dm in company_dept_memberships:
+        uid_s = str(dm.user_id)
+        user_dept_map[uid_s] = {
+            "department_id": str(dm.department_id),
+            "department_name": dm.department.name,
+            "department_code": dm.department.code,
+            "is_head": dm.is_head,
+        }
+        if dm.is_head:
             head_map[str(dm.department_id)] = {
-                "id": str(dm.user_id),
+                "id": uid_s,
                 "full_name": dm.user.full_name,
                 "email": dm.user.email,
                 "designation": dm.user.designation,
             }
 
-    # Team leaders lookup
-    team_ids = [pt.team_id for pt in project.project_teams.all()]
+    # Team memberships across the company
+    company_team_memberships = list(
+        TeamMembership.objects.filter(
+            team__department__company_id=project.company_id,
+            status=TeamMembership.Status.ACTIVE,
+        ).select_related("user", "team", "team__department")
+    )
     leader_map = {}
     team_members_count_map = {}
-    if team_ids:
-        for tm in TeamMembership.objects.filter(
-            team_id__in=team_ids,
-            status=TeamMembership.Status.ACTIVE,
-        ).select_related("user"):
-            tid_str = str(tm.team_id)
-            team_members_count_map[tid_str] = team_members_count_map.get(tid_str, 0) + 1
-            if tm.is_leader:
-                leader_map[tid_str] = {
-                    "id": str(tm.user_id),
-                    "full_name": tm.user.full_name,
-                    "email": tm.user.email,
-                    "designation": tm.user.designation,
+    team_roster_map: dict[str, list] = {}
+    user_teams_map: dict[str, list] = {}
+
+    for tm in company_team_memberships:
+        tid_str = str(tm.team_id)
+        uid_str = str(tm.user_id)
+        team_members_count_map[tid_str] = team_members_count_map.get(tid_str, 0) + 1
+        user_teams_map.setdefault(uid_str, []).append(
+            {
+                "team_id": tid_str,
+                "team_name": tm.team.name,
+                "team_code": tm.team.code,
+                "department_id": str(tm.team.department_id),
+                "department_name": tm.team.department.name,
+                "is_leader": tm.is_leader,
+            }
+        )
+        pm_rec = pm_by_user_id.get(uid_str)
+        user_t_ids = assigned_task_ids_by_user.get(uid_str, set())
+        team_roster_map.setdefault(tid_str, []).append(
+            {
+                "user_id": uid_str,
+                "full_name": tm.user.full_name,
+                "email": tm.user.email,
+                "designation": tm.user.designation,
+                "is_leader": tm.is_leader,
+                "is_project_member": bool(pm_rec and pm_rec.status == ProjectMember.Status.ACTIVE),
+                "project_member_id": str(pm_rec.id) if pm_rec else None,
+                "role_in_project": pm_rec.role_in_project if pm_rec else None,
+                "participation_status": pm_rec.status if pm_rec else "Not Assigned",
+                "assigned_tasks_count": len(user_t_ids),
+            }
+        )
+        if tm.is_leader:
+            leader_map[tid_str] = {
+                "id": uid_str,
+                "full_name": tm.user.full_name,
+                "email": tm.user.email,
+                "designation": tm.user.designation,
+            }
+
+    # Multi-project participation lookup for all members of this project (SRS §1.3 & §27.1)
+    member_user_ids = [pm.user_id for pm in project_members_qs]
+    other_projects_by_user: dict[str, list] = {}
+    if member_user_ids:
+        other_pms = (
+            ProjectMember.objects.filter(
+                user_id__in=member_user_ids,
+                status=ProjectMember.Status.ACTIVE,
+            )
+            .exclude(project=project)
+            .select_related("project")
+        )
+        for opm in other_pms:
+            other_projects_by_user.setdefault(str(opm.user_id), []).append(
+                {
+                    "project_id": str(opm.project_id),
+                    "code": opm.project.code,
+                    "name": opm.project.name,
+                    "status": opm.project.status,
+                    "role_in_project": opm.role_in_project,
                 }
+            )
 
     # Group participating teams by department_id
     teams_by_dept: dict[str, list] = {}
+    participating_teams_flat: list = []
     for pt in project.project_teams.select_related("team", "team__department").all():
         tid_str = str(pt.team_id)
         did_str = str(pt.team.department_id)
         t_tasks = [t for t in top_tasks if t.team_id == pt.team_id]
         t_done = sum(1 for t in t_tasks if t.status == "Completed")
-        t_prog = round(sum(float(t.progress) for t in t_tasks) / len(t_tasks), 1) if t_tasks else 0.0
-        teams_by_dept.setdefault(did_str, []).append(
-            {
-                "id": str(pt.id),
-                "team_id": tid_str,
-                "name": pt.team.name,
-                "code": pt.team.code,
-                "department_id": did_str,
-                "department_name": pt.team.department.name,
-                "team_leader": leader_map.get(tid_str),
-                "active_team_members_count": team_members_count_map.get(tid_str, 0),
-                "tasks_count": len(t_tasks),
-                "completed_tasks_count": t_done,
-                "progress": t_prog,
-                "created_at": pt.created_at,
-            }
+        t_in_prog = sum(1 for t in t_tasks if t.status in ("In Progress", "In Review", "Approved"))
+        t_overdue = sum(
+            1
+            for t in t_tasks
+            if t.due_date and t.due_date < today and t.status not in ("Completed", "Cancelled")
         )
+        t_prog = round(sum(float(t.progress) for t in t_tasks) / len(t_tasks), 1) if t_tasks else 0.0
+        roster = team_roster_map.get(tid_str, [])
+        participating_count = sum(1 for r in roster if r["is_project_member"])
+        team_entry = {
+            "id": str(pt.id),
+            "team_id": tid_str,
+            "name": pt.team.name,
+            "code": pt.team.code,
+            "department_id": did_str,
+            "department_name": pt.team.department.name,
+            "team_leader": leader_map.get(tid_str),
+            "active_team_members_count": team_members_count_map.get(tid_str, 0),
+            "participating_members_count": participating_count,
+            "team_members": roster,
+            "tasks_count": len(t_tasks),
+            "completed_tasks_count": t_done,
+            "in_progress_tasks_count": t_in_prog,
+            "overdue_tasks_count": t_overdue,
+            "progress": t_prog,
+            "created_at": pt.created_at,
+        }
+        teams_by_dept.setdefault(did_str, []).append(team_entry)
+        participating_teams_flat.append(team_entry)
 
     participating_departments = []
     for pd in project.project_departments.select_related("department").all():
@@ -415,22 +696,53 @@ def get_project_assignment_hierarchy(*, project: Project) -> dict:
         )
 
     members_list = []
-    for pm in project.members.select_related("user").all():
-        owned_count = sum(1 for t in all_tasks if t.task_owner_id == pm.user_id)
+    for pm in project_members_qs:
+        uid_s = str(pm.user_id)
+        owned_tasks = [t for t in all_tasks if t.task_owner_id == pm.user_id]
+        user_task_ids = assigned_task_ids_by_user.get(uid_s, set())
+        user_tasks = [task_by_id[tid] for tid in user_task_ids if tid in task_by_id]
+        completed_cnt = sum(1 for t in user_tasks if t.status == "Completed")
+        in_prog_cnt = sum(1 for t in user_tasks if t.status in ("In Progress", "In Review", "Approved"))
+        overdue_cnt = sum(
+            1
+            for t in user_tasks
+            if t.due_date and t.due_date < today and t.status not in ("Completed", "Cancelled")
+        )
+        effort_hrs = round(
+            sum(float(t.estimated_effort or 0) for t in user_tasks), 1
+        )
+        dept_info = user_dept_map.get(uid_s)
+        other_projs = other_projects_by_user.get(uid_s, [])
+
         members_list.append(
             {
                 "id": str(pm.id),
-                "user": str(pm.user_id),
+                "user": uid_s,
                 "user_full_name": pm.user.full_name,
                 "user_email": pm.user.email,
+                "user_employee_id": pm.user.employee_id,
                 "user_designation": pm.user.designation,
+                "department_id": dept_info["department_id"] if dept_info else None,
+                "department_name": dept_info["department_name"] if dept_info else None,
+                "teams": user_teams_map.get(uid_s, []),
+                "is_project_manager": pm.user_id == project.project_manager_id,
                 "role_in_project": pm.role_in_project,
                 "status": pm.status,
-                "owned_tasks_count": owned_count,
+                "owned_tasks_count": len(owned_tasks),
+                "assigned_tasks_count": len(user_tasks),
+                "completed_tasks_count": completed_cnt,
+                "in_progress_tasks_count": in_prog_cnt,
+                "overdue_tasks_count": overdue_cnt,
+                "estimated_effort_hours": effort_hrs,
+                "other_active_projects_count": len(other_projs),
+                "other_active_projects": other_projs,
                 "joined_at": pm.joined_at,
                 "left_at": pm.left_at,
             }
         )
+
+    active_members_count = sum(1 for m in members_list if m["status"] == ProjectMember.Status.ACTIVE)
+    historical_members_count = len(members_list) - active_members_count
 
     return {
         "project_id": str(project.id),
@@ -453,9 +765,62 @@ def get_project_assignment_hierarchy(*, project: Project) -> dict:
             if project.project_manager_id
             else None
         ),
+        "summary": {
+            "participating_departments_count": len(participating_departments),
+            "participating_teams_count": len(participating_teams_flat),
+            "active_members_count": active_members_count,
+            "historical_members_count": historical_members_count,
+            "total_tasks_count": len(top_tasks),
+        },
         "participating_departments": participating_departments,
+        "participating_teams": participating_teams_flat,
         "members": members_list,
     }
+
+
+def get_user_project_participations(*, user_id, company_id=None) -> list[dict]:
+    """
+    SRS §1.3, §3.3, §4.3, §19 & §27.1:
+    Returns all projects an employee participates in (with active or historical status),
+    their role_in_project, participating teams, and task workload on each project.
+    """
+    qs = ProjectMember.objects.filter(user_id=user_id).select_related(
+        "project", "project__company", "project__project_manager"
+    )
+    if company_id:
+        qs = qs.filter(project__company_id=company_id)
+
+    results = []
+    for pm in qs.order_by("-joined_at"):
+        proj = pm.project
+        owned_tasks_count = proj.tasks.filter(task_owner_id=user_id).count()
+        completed_tasks_count = proj.tasks.filter(
+            task_owner_id=user_id, status="Completed"
+        ).count()
+        results.append(
+            {
+                "membership_id": str(pm.id),
+                "project_id": str(proj.id),
+                "project_code": proj.code,
+                "project_name": proj.name,
+                "project_status": proj.status,
+                "project_priority": proj.priority,
+                "project_progress": float(proj.progress),
+                "company_id": str(proj.company_id),
+                "company_name": proj.company.name,
+                "company_code": proj.company.code,
+                "project_manager_name": (
+                    proj.project_manager.full_name if proj.project_manager else None
+                ),
+                "role_in_project": pm.role_in_project,
+                "participation_status": pm.status,
+                "owned_tasks_count": owned_tasks_count,
+                "completed_tasks_count": completed_tasks_count,
+                "joined_at": pm.joined_at,
+                "left_at": pm.left_at,
+            }
+        )
+    return results
 
 
 @transaction.atomic

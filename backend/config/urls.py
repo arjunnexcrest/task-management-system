@@ -64,19 +64,26 @@ def api_root(request):
 
 def lookup_data(request):
     from apps.accounts.models import User
-    from apps.companies.models import Company
+    from apps.companies.models import Company, CompanyMembership
     from apps.organization.models import Department, DepartmentMembership, Team, TeamMembership
 
     companies = list(Company.objects.values("id", "name", "code", "status"))
 
     head_map = {}
+    user_dept_ids: dict[str, list[str]] = {}
+    user_dept_names: dict[str, list[str]] = {}
     for dm in DepartmentMembership.objects.filter(
-        is_head=True, status=DepartmentMembership.Status.ACTIVE
-    ).select_related("user"):
-        head_map[dm.department_id] = {
-            "id": str(dm.user_id),
-            "full_name": dm.user.full_name,
-        }
+        status=DepartmentMembership.Status.ACTIVE
+    ).select_related("user", "department"):
+        uid_s = str(dm.user_id)
+        did_s = str(dm.department_id)
+        user_dept_ids.setdefault(uid_s, []).append(did_s)
+        user_dept_names.setdefault(uid_s, []).append(dm.department.name)
+        if dm.is_head:
+            head_map[dm.department_id] = {
+                "id": uid_s,
+                "full_name": dm.user.full_name,
+            }
 
     departments = []
     for d in Department.objects.all():
@@ -94,20 +101,31 @@ def lookup_data(request):
         )
 
     leader_map = {}
+    team_member_ids_map: dict[str, list[str]] = {}
+    user_team_ids: dict[str, list[str]] = {}
+    user_team_names: dict[str, list[str]] = {}
     for tm in TeamMembership.objects.filter(
-        is_leader=True, status=TeamMembership.Status.ACTIVE
-    ).select_related("user"):
-        leader_map[tm.team_id] = {
-            "id": str(tm.user_id),
-            "full_name": tm.user.full_name,
-        }
+        status=TeamMembership.Status.ACTIVE
+    ).select_related("user", "team"):
+        uid_s = str(tm.user_id)
+        tid_s = str(tm.team_id)
+        team_member_ids_map.setdefault(tid_s, []).append(uid_s)
+        user_team_ids.setdefault(uid_s, []).append(tid_s)
+        user_team_names.setdefault(uid_s, []).append(tm.team.name)
+        if tm.is_leader:
+            leader_map[tm.team_id] = {
+                "id": uid_s,
+                "full_name": tm.user.full_name,
+            }
 
     teams = []
     for t in Team.objects.select_related("department").all():
         leader = leader_map.get(t.id)
+        tid_s = str(t.id)
+        m_ids = team_member_ids_map.get(tid_s, [])
         teams.append(
             {
-                "id": str(t.id),
+                "id": tid_s,
                 "department_id": str(t.department_id),
                 "department_name": t.department.name,
                 "company_id": str(t.department.company_id),
@@ -116,20 +134,34 @@ def lookup_data(request):
                 "status": t.status,
                 "team_leader_id": leader["id"] if leader else None,
                 "team_leader_name": leader["full_name"] if leader else None,
+                "active_members_count": len(m_ids),
+                "member_ids": m_ids,
             }
         )
 
-    users = list(
-        User.objects.values(
-            "id",
-            "email",
-            "username",
-            "full_name",
-            "employee_id",
-            "designation",
-            "account_status",
+    user_company_ids: dict[str, list[str]] = {}
+    for cm in CompanyMembership.objects.filter(status=CompanyMembership.Status.ACTIVE):
+        user_company_ids.setdefault(str(cm.user_id), []).append(str(cm.company_id))
+
+    users = []
+    for u in User.objects.all():
+        uid_s = str(u.id)
+        users.append(
+            {
+                "id": uid_s,
+                "email": u.email,
+                "username": u.username,
+                "full_name": u.full_name,
+                "employee_id": u.employee_id,
+                "designation": u.designation,
+                "account_status": u.account_status,
+                "company_ids": user_company_ids.get(uid_s, []),
+                "department_ids": user_dept_ids.get(uid_s, []),
+                "department_names": user_dept_names.get(uid_s, []),
+                "team_ids": user_team_ids.get(uid_s, []),
+                "team_names": user_team_names.get(uid_s, []),
+            }
         )
-    )
 
     return JsonResponse(
         {

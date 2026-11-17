@@ -276,3 +276,246 @@ class APIStructureAndSerializersTestCase(APITestCase):
         dash_res = self.client.get(f"/api/dashboards/summary/?company={self.company_a.id}")
         self.assertEqual(dash_res.status_code, 200)
         self.assertEqual(dash_res.data["projects"]["total_projects"], 1)
+
+    def test_task_crud_create_read_update_delete_api(self):
+        """
+        End-to-end test for SRS §7.1–§7.11 Task & Subtask Create, Read/Filter, Update/Edit, and Delete APIs.
+        """
+        self.client.force_authenticate(user=self.user_a)
+
+        dev2 = User.objects.create_user(
+            email="dev2@companya.com",
+            username="dev2_a",
+            full_name="Dev Two A",
+            password="Password123!",
+        )
+        CompanyMembership.objects.create(company=self.company_a, user=dev2, status="Active")
+        team_a = Team.objects.create(department=self.dept_a, name="API Team A", code="APIA")
+
+        # 1. CREATE Task with full SRS §7.1 fields + assignees + tags + initial checklist
+        create_res = self.client.post(
+            "/api/tasks/",
+            {
+                "project": str(self.project_a.id),
+                "department": str(self.dept_a.id),
+                "team": str(team_a.id),
+                "title": "Build OAuth2 Token Service",
+                "description": "Implement JWT rotation and revocation endpoints.",
+                "task_owner": str(self.user_a.id),
+                "reviewer": str(dev2.id),
+                "priority": "Critical",
+                "status": "To Do",
+                "start_date": "2026-11-01",
+                "due_date": "2026-11-10",
+                "estimated_effort": "24.50",
+                "approval_required": True,
+                "assignee_user_ids": [str(self.user_a.id)],
+                "assignee_team_ids": [str(team_a.id)],
+                "tag_names": ["security", "oauth2", "backend"],
+                "initial_checklist_items": ["Define token model", "Add refresh endpoint"],
+            },
+            format="json",
+        )
+        self.assertEqual(create_res.status_code, 201, create_res.content)
+        task_id = create_res.data["id"]
+        self.assertEqual(create_res.data["title"], "Build OAuth2 Token Service")
+        self.assertEqual(create_res.data["status"], "Assigned")  # auto-transitioned from To Do upon assignment
+        self.assertEqual(len(create_res.data["assignee_user_ids"]), 1)
+        self.assertEqual(len(create_res.data["assignee_team_ids"]), 1)
+        self.assertEqual(set(create_res.data["tag_names"]), {"security", "oauth2", "backend"})
+
+        # 2. CREATE Subtask under parent_task
+        sub_res = self.client.post(
+            "/api/tasks/",
+            {
+                "project": str(self.project_a.id),
+                "parent_task": task_id,
+                "title": "Write OAuth2 Unit Tests",
+                "priority": "High",
+                "assignee_user_ids": [str(dev2.id)],
+            },
+            format="json",
+        )
+        self.assertEqual(sub_res.status_code, 201, sub_res.content)
+        subtask_id = sub_res.data["id"]
+        self.assertTrue(sub_res.data["is_subtask"])
+        self.assertEqual(sub_res.data["parent_task_title"], "Build OAuth2 Token Service")
+
+        # 3. READ & FILTER Task List (SRS §7.11)
+        list_res = self.client.get(
+            f"/api/tasks/?company={self.company_a.id}&tag=oauth2&is_subtask=false"
+        )
+        self.assertEqual(list_res.status_code, 200)
+        items = list_res.data["results"] if "results" in list_res.data else list_res.data
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["id"], task_id)
+
+        # 4. UPDATE / EDIT Task (PATCH /api/tasks/{id}/) including assignee reassignment & tags
+        patch_res = self.client.patch(
+            f"/api/tasks/{task_id}/",
+            {
+                "title": "Build OAuth2 Token Service v2",
+                "priority": "High",
+                "estimated_effort": "30.00",
+                "assignee_user_ids": [str(dev2.id)],  # reassigns from user_a to dev2
+                "tag_names": ["security", "v2"],
+            },
+            format="json",
+        )
+        self.assertEqual(patch_res.status_code, 200, patch_res.content)
+        self.assertEqual(patch_res.data["title"], "Build OAuth2 Token Service v2")
+        self.assertEqual(patch_res.data["assignee_user_ids"], [str(dev2.id)])
+        self.assertEqual(set(patch_res.data["tag_names"]), {"security", "v2"})
+        # Previous assignment for user_a is preserved as 'Reassigned' (DB Design §4.4 & §5)
+        self.assertTrue(
+            TaskAssignment.objects.filter(
+                task_id=task_id, user=self.user_a, status=TaskAssignment.Status.REASSIGNED
+            ).exists()
+        )
+
+        # 5. DELETE Task (DELETE /api/tasks/{id}/) cleanly removes task, subtasks & protected records
+        del_res = self.client.delete(f"/api/tasks/{task_id}/")
+        self.assertEqual(del_res.status_code, 204)
+        self.assertFalse(Task.objects.filter(id=task_id).exists())
+        self.assertFalse(Task.objects.filter(id=subtask_id).exists())
+
+    def test_task_assignment_priority_and_due_dates_workflow(self):
+        """
+        Tests SRS §7.2 (Individual, Team, Reassignment, Bulk Assignment, Acknowledge),
+        SRS §7.4 (Priority), SRS §7.10 (Due dates, Rescheduling, Overdue & Due Status).
+        """
+        from datetime import timedelta
+        from django.utils import timezone
+        from apps.notifications.models import Notification
+        from apps.organization.models import TeamMembership
+
+        self.client.force_authenticate(user=self.user_a)
+
+        dev = User.objects.create_user(
+            email="assign_dev@companya.com",
+            username="assign_dev",
+            full_name="Assigned Dev",
+            password="Password123!",
+        )
+        lead = User.objects.create_user(
+            email="assign_lead@companya.com",
+            username="assign_lead",
+            full_name="Team Lead A",
+            password="Password123!",
+        )
+        CompanyMembership.objects.create(company=self.company_a, user=dev, status="Active")
+        CompanyMembership.objects.create(company=self.company_a, user=lead, status="Active")
+
+        team = Team.objects.create(department=self.dept_a, name="Platform Team", code="PLAT")
+        TeamMembership.objects.create(team=team, user=lead, is_leader=True, status="Active")
+
+        today = timezone.now().date()
+        t1 = Task.objects.create(
+            project=self.project_a,
+            title="Database Indexing",
+            created_by=self.user_a,
+            priority=Task.Priority.MEDIUM,
+            due_date=today - timedelta(days=2),
+        )
+        t2 = Task.objects.create(
+            project=self.project_a,
+            title="Cache Warming Job",
+            created_by=self.user_a,
+            priority=Task.Priority.LOW,
+            due_date=today + timedelta(days=1),
+        )
+
+        # 1. Verify overdue & due_status calculation
+        t1_res = self.client.get(f"/api/tasks/{t1.id}/")
+        self.assertEqual(t1_res.status_code, 200)
+        self.assertTrue(t1_res.data["is_overdue"])
+        self.assertEqual(t1_res.data["due_status"], "Overdue")
+        self.assertEqual(t1_res.data["days_remaining"], -2)
+
+        t2_res = self.client.get(f"/api/tasks/{t2.id}/")
+        self.assertEqual(t2_res.data["due_status"], "Due Soon")
+
+        # 2. Team assignment coordinates Team Leader as default task_owner when entire_team_responsible=False
+        team_assign_res = self.client.post(
+            f"/api/tasks/{t1.id}/assign/",
+            {
+                "assignment_type": "Team",
+                "team": str(team.id),
+                "entire_team_responsible": False,
+            },
+            format="json",
+        )
+        self.assertEqual(team_assign_res.status_code, 201, team_assign_res.content)
+        t1.refresh_from_db()
+        self.assertEqual(t1.task_owner_id, lead.id)
+        self.assertEqual(t1.status, Task.Status.ASSIGNED)
+
+        # 3. Acknowledge assignment
+        ack_res = self.client.post(
+            f"/api/tasks/assignments/{team_assign_res.data['id']}/acknowledge/"
+        )
+        self.assertEqual(ack_res.status_code, 200)
+        self.assertEqual(ack_res.data["status"], "Acknowledged")
+
+        # 4. Bulk assign user + Critical priority + new due_date across both tasks
+        new_due = today + timedelta(days=7)
+        bulk_res = self.client.post(
+            "/api/tasks/bulk_assign/",
+            {
+                "task_ids": [str(t1.id), str(t2.id)],
+                "user": str(dev.id),
+                "priority": "Critical",
+                "due_date": str(new_due),
+                "replace_existing": True,
+            },
+            format="json",
+        )
+        self.assertEqual(bulk_res.status_code, 200, bulk_res.content)
+        self.assertEqual(bulk_res.data["updated_count"], 2)
+        t1.refresh_from_db()
+        t2.refresh_from_db()
+        self.assertEqual(t1.priority, "Critical")
+        self.assertEqual(t2.priority, "Critical")
+        self.assertEqual(t1.due_date, new_due)
+        self.assertTrue(
+            TaskAssignment.objects.filter(
+                task=t1, team=team, status=TaskAssignment.Status.REASSIGNED
+            ).exists()
+        )
+        self.assertTrue(
+            Notification.objects.filter(user=dev, related_task=t1).exists()
+        )
+
+        # 5. Reschedule task with invalid date (due_date < start_date) returns 400
+        bad_sched = self.client.post(
+            f"/api/tasks/{t1.id}/reschedule/",
+            {
+                "start_date": str(today + timedelta(days=10)),
+                "due_date": str(today + timedelta(days=5)),
+            },
+            format="json",
+        )
+        self.assertEqual(bad_sched.status_code, 400)
+
+        # Valid reschedule logs deadline change comment and updates priority & effort
+        ok_sched = self.client.post(
+            f"/api/tasks/{t1.id}/reschedule/",
+            {
+                "start_date": str(today),
+                "due_date": str(today + timedelta(days=14)),
+                "estimated_effort": "18.5",
+                "priority": "High",
+                "reason": "Client requested extended QA cycle",
+            },
+            format="json",
+        )
+        self.assertEqual(ok_sched.status_code, 200, ok_sched.content)
+        self.assertEqual(ok_sched.data["priority"], "High")
+        self.assertEqual(ok_sched.data["due_status"], "On Track")
+        self.assertTrue(
+            TaskComment.objects.filter(
+                task=t1, content__icontains="Client requested extended QA cycle"
+            ).exists()
+        )
+
+

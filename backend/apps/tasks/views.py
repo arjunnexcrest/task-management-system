@@ -40,7 +40,13 @@ from .serializers import (
     TaskTagAssignmentSerializer,
     TaskTagSerializer,
 )
-from .services import assign_task_service, transition_task_status_service
+from .services import (
+    assign_task_service,
+    bulk_assign_tasks_service,
+    delete_task_service,
+    reschedule_task_service,
+    transition_task_status_service,
+)
 
 
 def _default_user(request):
@@ -72,10 +78,21 @@ class TaskViewSet(viewsets.ModelViewSet):
         else:
             serializer.save()
 
+    def destroy(self, request, *args, **kwargs):
+        task = self.get_object()
+        try:
+            delete_task_service(task=task)
+        except DjangoValidationError as exc:
+            msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
     @action(detail=True, methods=["post"])
     def assign(self, request, pk=None):
         """
-        Assigns a user or team to the task while preserving assignment history (DB Design §4.4, §5 & §7).
+        SRS §7.2 & DB Design §4.4, §5, §7:
+        Assigns a user or team to the task while preserving assignment history,
+        supporting optional task_owner, reviewer, and entire_team_responsible flags.
         """
         task = self.get_object()
         try:
@@ -84,13 +101,71 @@ class TaskViewSet(viewsets.ModelViewSet):
                 assignment_type=request.data.get("assignment_type", TaskAssignment.AssignmentType.USER),
                 user_id=request.data.get("user"),
                 team_id=request.data.get("team"),
-                assigned_by_id=request.data.get("assigned_by") or task.created_by_id,
+                assigned_by_id=request.data.get("assigned_by") or getattr(_default_user(request), "id", None) or task.created_by_id,
                 replace_existing=bool(request.data.get("replace_existing", False)),
+                task_owner_id=request.data.get("task_owner"),
+                reviewer_id=request.data.get("reviewer"),
+                entire_team_responsible=bool(request.data.get("entire_team_responsible", False)),
             )
         except DjangoValidationError as exc:
             msg = exc.message_dict if hasattr(exc, "message_dict") else (exc.messages if hasattr(exc, "messages") else str(exc))
             return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
         return Response(TaskAssignmentSerializer(assignment).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["post"])
+    def bulk_assign(self, request):
+        """
+        SRS §7.2 Bulk Assignment, §7.4 Priority & §7.10 Due Dates:
+        Atomically assigns users/teams, owner, reviewer, priority, or due dates across multiple tasks.
+        """
+        try:
+            updated = bulk_assign_tasks_service(
+                task_ids=request.data.get("task_ids", []),
+                actor=_default_user(request),
+                user_id=request.data.get("user"),
+                assignee_user_ids=request.data.get("assignee_user_ids"),
+                team_id=request.data.get("team"),
+                assignee_team_ids=request.data.get("assignee_team_ids"),
+                task_owner_id=request.data.get("task_owner"),
+                reviewer_id=request.data.get("reviewer"),
+                priority=request.data.get("priority"),
+                due_date=request.data.get("due_date"),
+                start_date=request.data.get("start_date"),
+                replace_existing=bool(request.data.get("replace_existing", False)),
+            )
+        except DjangoValidationError as exc:
+            msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            {
+                "updated_count": len(updated),
+                "tasks": TaskSerializer(updated, many=True).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["post"])
+    def reschedule(self, request, pk=None):
+        """
+        SRS §7.4, §7.10 & §22 #12:
+        Updates start_date, due_date, estimated_effort, and/or priority with deadline-change tracking.
+        """
+        task = self.get_object()
+        try:
+            updated = reschedule_task_service(
+                task=task,
+                start_date=request.data.get("start_date"),
+                due_date=request.data.get("due_date"),
+                estimated_effort=request.data.get("estimated_effort"),
+                priority=request.data.get("priority"),
+                reason=request.data.get("reason"),
+                actor=_default_user(request),
+            )
+        except DjangoValidationError as exc:
+            msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        refreshed = get_task_detail_queryset(request).get(pk=updated.pk)
+        return Response(TaskDetailSerializer(refreshed).data)
 
     @action(detail=True, methods=["post"], url_path="transition-status")
     def transition_status(self, request, pk=None):

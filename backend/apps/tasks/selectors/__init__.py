@@ -8,7 +8,8 @@ def get_task_list_queryset(request=None):
     Implements DB Design §6 & §8:
     - Scoped by company (`project__company_id`).
     - Uses select_related for single-valued FKs (project, parent_task, phase, department,
-      team, task_owner, created_by, reviewer) and prefetch_related for assignments and tags.
+      team, task_owner, created_by, reviewer) and prefetch_related for assignments, tags,
+      dependencies, and time_entries.
     """
     qs = (
         Task.objects.select_related(
@@ -27,6 +28,8 @@ def get_task_list_queryset(request=None):
             "assignments__team",
             "assignments__assigned_by",
             "tag_assignments__tag",
+            "dependencies",
+            "time_entries",
         )
         .annotate(annotated_subtasks_count=Count("subtasks", distinct=True))
     )
