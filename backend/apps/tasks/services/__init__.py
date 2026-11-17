@@ -1,90 +1,426 @@
+from datetime import date
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
+from apps.accounts.models import User
+from apps.companies.models import CompanyMembership
 from apps.notifications.models import Notification
+from apps.organization.models import Team, TeamMembership
 from apps.projects.models import ProjectMember
 from apps.tasks.models import (
     Checklist,
     ChecklistItem,
     Task,
     TaskAssignment,
+    TaskComment,
     TaskDependency,
     TaskTag,
     TaskTagAssignment,
 )
 
 
+def _validate_user_in_project_company(user: User, company, label: str = "User"):
+    if getattr(user, "is_superuser", False) or getattr(company, "company_incharge_id", None) == user.id:
+        return
+    has_any = (
+        CompanyMembership.objects.filter(company=company).exists()
+        or CompanyMembership.objects.filter(user=user).exists()
+    )
+    if not has_any:
+        return
+    is_member = CompanyMembership.objects.filter(
+        company=company,
+        user=user,
+        status=CompanyMembership.Status.ACTIVE,
+    ).exists()
+    if not is_member:
+        raise ValidationError(
+            f"{label} '{user.full_name}' does not belong to company '{company.code}' (DB Design §5)."
+        )
+
+
+def _validate_team_in_project_company(team: Team, company):
+    if team.department.company_id != company.id:
+        raise ValidationError(
+            f"Team '{team.name}' does not belong to company '{company.code}' (DB Design §5)."
+        )
+
+
 @transaction.atomic
 def assign_task_service(
     *,
     task: Task,
-    assignment_type: str,
+    assignment_type: str = TaskAssignment.AssignmentType.USER,
     user_id=None,
     team_id=None,
     assigned_by_id=None,
     replace_existing: bool = False,
+    task_owner_id=None,
+    reviewer_id=None,
+    entire_team_responsible: bool = False,
 ) -> TaskAssignment:
     """
-    Atomically assigns a task to a User or Team while preserving assignment history
-    (DB Design §4.4, §5, and §7 Rule #7).
+    SRS §7.2 & §22 Rules #3, #4, #11 & DB Design §4.4, §5, §7:
+    Atomically assigns a task to a User or Team while validating company permissions,
+    preserving assignment history on reassignment, handling team vs. individual task owner
+    selection, and notifying assignees.
     """
+    company = task.project.company
+    assigner_id = assigned_by_id or task.created_by_id
+
+    target_user = None
+    target_team = None
+    if assignment_type == TaskAssignment.AssignmentType.USER:
+        if not user_id:
+            raise ValidationError("A valid user must be provided when assignment_type is 'User'.")
+        target_user = User.objects.filter(id=user_id).first()
+        if not target_user:
+            raise ValidationError("Selected assignee user was not found.")
+        _validate_user_in_project_company(target_user, company, label="Assignee user")
+    elif assignment_type == TaskAssignment.AssignmentType.TEAM:
+        if not team_id:
+            raise ValidationError("A valid team must be provided when assignment_type is 'Team'.")
+        target_team = Team.objects.select_related("department").filter(id=team_id).first()
+        if not target_team:
+            raise ValidationError("Selected assignee team was not found.")
+        _validate_team_in_project_company(target_team, company)
+    else:
+        raise ValidationError(f"Unsupported assignment_type '{assignment_type}'.")
+
     if replace_existing:
         for active in task.assignments.filter(status__in=["Active", "Acknowledged"]):
+            # Do not end the exact same target if it's already active; we'll reuse or keep it
+            if target_user and active.user_id == target_user.id:
+                continue
+            if target_team and active.team_id == target_team.id:
+                continue
             active.end_assignment(status=TaskAssignment.Status.REASSIGNED)
 
-    target_user_id = user_id if assignment_type == TaskAssignment.AssignmentType.USER else None
-    target_team_id = team_id if assignment_type == TaskAssignment.AssignmentType.TEAM else None
-
-    # Check if an active assignment for the same target already exists (avoid duplicate active constraint violation)
-    if target_user_id:
+    # Check if an active assignment for the same target already exists
+    existing_active = None
+    if target_user:
         existing_active = task.assignments.filter(
             assignment_type=TaskAssignment.AssignmentType.USER,
-            user_id=target_user_id,
+            user=target_user,
             status__in=["Active", "Acknowledged"],
         ).first()
-        if existing_active:
-            return existing_active
-    elif target_team_id:
+    elif target_team:
         existing_active = task.assignments.filter(
             assignment_type=TaskAssignment.AssignmentType.TEAM,
-            team_id=target_team_id,
+            team=target_team,
             status__in=["Active", "Acknowledged"],
         ).first()
-        if existing_active:
-            return existing_active
 
-    assignment = TaskAssignment(
-        task=task,
-        assignment_type=assignment_type,
-        user_id=target_user_id,
-        team_id=target_team_id,
-        assigned_by_id=assigned_by_id or task.created_by_id,
-        status=TaskAssignment.Status.ACTIVE,
-    )
-    assignment.full_clean()
-    assignment.save()
+    if existing_active:
+        assignment = existing_active
+    else:
+        assignment = TaskAssignment(
+            task=task,
+            assignment_type=assignment_type,
+            user=target_user,
+            team=target_team,
+            assigned_by_id=assigner_id,
+            status=TaskAssignment.Status.ACTIVE,
+        )
+        assignment.full_clean()
+        assignment.save()
 
-    # Ensure assigned user is an active ProjectMember participant on the task's project
-    if target_user_id:
-        ProjectMember.objects.update_or_create(
-            project=task.project,
-            user_id=target_user_id,
-            defaults={"status": ProjectMember.Status.ACTIVE, "left_at": None},
+    # Update task_owner / reviewer / team on task if requested (SRS §7.2)
+    task_update_fields = []
+    if task_owner_id:
+        owner_user = User.objects.filter(id=task_owner_id).first()
+        if not owner_user:
+            raise ValidationError("Selected task owner was not found.")
+        _validate_user_in_project_company(owner_user, company, label="Task owner")
+        task.task_owner = owner_user
+        task_update_fields.append("task_owner")
+    elif target_user and (replace_existing or not task.task_owner_id):
+        task.task_owner = target_user
+        task_update_fields.append("task_owner")
+    elif target_team and not entire_team_responsible and not task.task_owner_id:
+        # SRS §7.2: If team-assigned and individual owner not yet set, coordinate Team Leader as default owner
+        leader_mem = (
+            TeamMembership.objects.filter(
+                team=target_team,
+                is_leader=True,
+                status=TeamMembership.Status.ACTIVE,
+            )
+            .select_related("user")
+            .first()
         )
-        Notification.objects.create(
-            user_id=target_user_id,
-            notification_type="TASK_ASSIGNED",
-            title=f"New Task Assigned: {task.title}",
-            message=f"You have been assigned to task '{task.title}' in project '{task.project.code}'.",
-            related_project=task.project,
-            related_task=task,
-        )
+        if leader_mem:
+            task.task_owner = leader_mem.user
+            task_update_fields.append("task_owner")
+
+    if target_team and not task.team_id:
+        task.team = target_team
+        task_update_fields.append("team")
+        if not task.department_id:
+            task.department_id = target_team.department_id
+            task_update_fields.append("department")
+
+    if reviewer_id:
+        rev_user = User.objects.filter(id=reviewer_id).first()
+        if not rev_user:
+            raise ValidationError("Selected reviewer was not found.")
+        _validate_user_in_project_company(rev_user, company, label="Reviewer")
+        task.reviewer = rev_user
+        task_update_fields.append("reviewer")
 
     if task.status in [Task.Status.BACKLOG, Task.Status.TO_DO]:
         task.status = Task.Status.ASSIGNED
-        task.save(update_fields=["status", "updated_at"])
+        task_update_fields.append("status")
+
+    if task_update_fields:
+        task_update_fields.append("updated_at")
+        task.save(update_fields=list(set(task_update_fields)))
+
+    # Ensure assigned user is an active ProjectMember participant on the task's project
+    if target_user:
+        ProjectMember.objects.update_or_create(
+            project=task.project,
+            user=target_user,
+            defaults={"status": ProjectMember.Status.ACTIVE, "left_at": None},
+        )
+        if not existing_active:
+            notif_type = "TASK_REASSIGNED" if replace_existing else "TASK_ASSIGNED"
+            Notification.objects.create(
+                user=target_user,
+                notification_type=notif_type,
+                title=f"{'Task Reassigned' if replace_existing else 'New Task Assigned'}: {task.title}",
+                message=f"You have been assigned to task '{task.title}' (Priority: {task.priority}, Due: {task.due_date or 'TBD'}) in project '{task.project.code}'.",
+                related_project=task.project,
+                related_task=task,
+            )
 
     return assignment
+
+
+@transaction.atomic
+def bulk_assign_tasks_service(
+    *,
+    task_ids: list,
+    actor: User | None = None,
+    user_id=None,
+    assignee_user_ids: list | None = None,
+    team_id=None,
+    assignee_team_ids: list | None = None,
+    task_owner_id=None,
+    reviewer_id=None,
+    priority: str | None = None,
+    due_date=None,
+    start_date=None,
+    replace_existing: bool = False,
+) -> list[Task]:
+    """
+    SRS §7.2 Bulk Assignment, §7.4 Priority & §7.10 Due Dates:
+    Atomically assigns users, teams, task owner, reviewer, priority, or due dates across
+    multiple tasks while preserving assignment history and validating company boundaries.
+    """
+    cleaned_ids = [str(tid) for tid in (task_ids or []) if tid]
+    if not cleaned_ids:
+        raise ValidationError("Provide at least one task_id for bulk assignment.")
+
+    tasks = list(Task.objects.select_related("project", "project__company").filter(id__in=cleaned_ids))
+    if len(tasks) != len(set(cleaned_ids)):
+        raise ValidationError("One or more selected tasks were not found.")
+
+    valid_priorities = {choice[0] for choice in Task.Priority.choices}
+    if priority and priority not in valid_priorities:
+        raise ValidationError(f"Invalid priority '{priority}'. Must be one of {sorted(valid_priorities)}.")
+
+    parsed_due = date.fromisoformat(str(due_date)) if due_date else None
+    parsed_start = date.fromisoformat(str(start_date)) if start_date else None
+
+    target_uids = list(assignee_user_ids or [])
+    if user_id and str(user_id) not in [str(u) for u in target_uids]:
+        target_uids.append(user_id)
+
+    target_tids = list(assignee_team_ids or [])
+    if team_id and str(team_id) not in [str(t) for t in target_tids]:
+        target_tids.append(team_id)
+
+    updated_tasks = []
+    for task in tasks:
+        company = task.project.company
+        assigner_id = getattr(actor, "id", None) or task.created_by_id
+
+        # 1. User / Team assignments
+        if replace_existing and (target_uids or target_tids):
+            for active in task.assignments.filter(status__in=["Active", "Acknowledged"]):
+                active.end_assignment(status=TaskAssignment.Status.REASSIGNED)
+
+        for uid in target_uids:
+            assign_task_service(
+                task=task,
+                assignment_type=TaskAssignment.AssignmentType.USER,
+                user_id=uid,
+                assigned_by_id=assigner_id,
+                replace_existing=False,
+            )
+
+        for tid in target_tids:
+            assign_task_service(
+                task=task,
+                assignment_type=TaskAssignment.AssignmentType.TEAM,
+                team_id=tid,
+                assigned_by_id=assigner_id,
+                replace_existing=False,
+            )
+
+        # 2. Direct field updates (task_owner, reviewer, priority, start_date, due_date)
+        update_fields = []
+        if task_owner_id:
+            owner_obj = User.objects.filter(id=task_owner_id).first()
+            if not owner_obj:
+                raise ValidationError("Selected task owner was not found.")
+            _validate_user_in_project_company(owner_obj, company, label="Task owner")
+            task.task_owner = owner_obj
+            update_fields.append("task_owner")
+
+        if reviewer_id:
+            rev_obj = User.objects.filter(id=reviewer_id).first()
+            if not rev_obj:
+                raise ValidationError("Selected reviewer was not found.")
+            _validate_user_in_project_company(rev_obj, company, label="Reviewer")
+            task.reviewer = rev_obj
+            update_fields.append("reviewer")
+
+        if priority:
+            task.priority = priority
+            update_fields.append("priority")
+
+        if parsed_start is not None:
+            task.start_date = parsed_start
+            update_fields.append("start_date")
+
+        if parsed_due is not None:
+            eff_start = parsed_start or task.start_date
+            if eff_start and parsed_due < eff_start:
+                raise ValidationError(
+                    f"Task '{task.title}': Due date ({parsed_due}) cannot be earlier than start date ({eff_start})."
+                )
+            old_due = task.due_date
+            task.due_date = parsed_due
+            update_fields.append("due_date")
+            if old_due != parsed_due:
+                TaskComment.objects.create(
+                    task=task,
+                    author_id=assigner_id,
+                    content=f"[Schedule Update] Due date updated from {old_due or 'None'} to {parsed_due}.",
+                )
+
+        if update_fields:
+            update_fields.append("updated_at")
+            task.save(update_fields=list(set(update_fields)))
+
+        task.refresh_from_db()
+        updated_tasks.append(task)
+
+    return updated_tasks
+
+
+@transaction.atomic
+def reschedule_task_service(
+    *,
+    task: Task,
+    start_date=None,
+    due_date=None,
+    estimated_effort=None,
+    priority: str | None = None,
+    reason: str | None = None,
+    actor: User | None = None,
+) -> Task:
+    """
+    SRS §7.4, §7.10 & §22 Rules #10, #12:
+    Updates task schedule (start_date, due_date, estimated_effort) and/or priority,
+    validates date ordering, records a traceable deadline change comment, and notifies assignees.
+    """
+    parsed_start = (
+        date.fromisoformat(str(start_date))
+        if start_date not in (None, "")
+        else (None if start_date == "" else task.start_date)
+    )
+    parsed_due = (
+        date.fromisoformat(str(due_date))
+        if due_date not in (None, "")
+        else (None if due_date == "" else task.due_date)
+    )
+
+    if parsed_start and parsed_due and parsed_due < parsed_start:
+        raise ValidationError("Due date cannot be earlier than start date (DB Design §5).")
+
+    old_start = task.start_date
+    old_due = task.due_date
+    old_priority = task.priority
+
+    update_fields = []
+    if start_date is not None and parsed_start != old_start:
+        task.start_date = parsed_start
+        update_fields.append("start_date")
+
+    if due_date is not None and parsed_due != old_due:
+        task.due_date = parsed_due
+        update_fields.append("due_date")
+
+    if estimated_effort is not None and estimated_effort != "":
+        if float(estimated_effort) < 0:
+            raise ValidationError("Estimated effort cannot be negative.")
+        task.estimated_effort = estimated_effort
+        update_fields.append("estimated_effort")
+
+    if priority:
+        valid_priorities = {choice[0] for choice in Task.Priority.choices}
+        if priority not in valid_priorities:
+            raise ValidationError(f"Invalid priority '{priority}'.")
+        if priority != old_priority:
+            task.priority = priority
+            update_fields.append("priority")
+
+    if update_fields:
+        update_fields.append("updated_at")
+        task.save(update_fields=update_fields)
+
+        author_id = getattr(actor, "id", None) or task.created_by_id
+        changes = []
+        if "due_date" in update_fields:
+            changes.append(f"Due date: {old_due or 'TBD'} → {parsed_due or 'TBD'}")
+        if "start_date" in update_fields:
+            changes.append(f"Start date: {old_start or 'TBD'} → {parsed_start or 'TBD'}")
+        if "priority" in update_fields:
+            changes.append(f"Priority: {old_priority} → {task.priority}")
+
+        if changes:
+            reason_suffix = f" | Reason: {reason.strip()}" if reason and reason.strip() else ""
+            TaskComment.objects.create(
+                task=task,
+                author_id=author_id,
+                content=f"[Schedule & Priority Update] {', '.join(changes)}{reason_suffix}",
+            )
+
+        # Notify task owner & active user assignees on deadline or priority change (SRS §13.1)
+        if "due_date" in update_fields or "priority" in update_fields:
+            recipient_ids = set()
+            if task.task_owner_id:
+                recipient_ids.add(task.task_owner_id)
+            for uid in task.assignments.filter(
+                assignment_type=TaskAssignment.AssignmentType.USER,
+                status__in=["Active", "Acknowledged"],
+                user_id__isnull=False,
+            ).values_list("user_id", flat=True):
+                recipient_ids.add(uid)
+
+            for uid in recipient_ids:
+                Notification.objects.create(
+                    user_id=uid,
+                    notification_type="DEADLINE_CHANGED",
+                    title=f"Schedule / Priority Updated: {task.title}",
+                    message=f"Task '{task.title}' updated ({', '.join(changes)}).",
+                    related_project=task.project,
+                    related_task=task,
+                )
+
+    return task
 
 
 @transaction.atomic

@@ -341,6 +341,8 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
     reviewer_name = serializers.CharField(source="reviewer.full_name", read_only=True, default=None)
     is_subtask = serializers.BooleanField(read_only=True)
     is_overdue = serializers.SerializerMethodField()
+    days_remaining = serializers.SerializerMethodField()
+    due_status = serializers.SerializerMethodField()
     subtasks_count = serializers.SerializerMethodField()
     actual_effort_hours = serializers.SerializerMethodField()
     active_assignments = serializers.SerializerMethodField()
@@ -415,6 +417,8 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
             "progress_method",
             "approval_required",
             "is_overdue",
+            "days_remaining",
+            "due_status",
             "subtasks_count",
             "active_assignments",
             "tags",
@@ -614,6 +618,25 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
         if obj.due_date and obj.status not in [Task.Status.COMPLETED, Task.Status.CANCELLED]:
             return obj.due_date < timezone.now().date()
         return False
+
+    def get_days_remaining(self, obj):
+        if not obj.due_date or obj.status in [Task.Status.COMPLETED, Task.Status.CANCELLED]:
+            return None
+        return (obj.due_date - timezone.now().date()).days
+
+    def get_due_status(self, obj):
+        if obj.status in [Task.Status.COMPLETED, Task.Status.CANCELLED]:
+            return "Completed"
+        if not obj.due_date:
+            return "No Due Date"
+        diff = (obj.due_date - timezone.now().date()).days
+        if diff < 0:
+            return "Overdue"
+        if diff == 0:
+            return "Due Today"
+        if diff <= 3:
+            return "Due Soon"
+        return "On Track"
 
     def get_subtasks_count(self, obj):
         if hasattr(obj, "annotated_subtasks_count"):
