@@ -52,4 +52,5 @@ def get_task_detail_queryset(request=None):
         "progress_updates__author",
         "progress_updates__progress_attachments__attachment__uploaded_by",
         "task_attachments__attachment__uploaded_by",
+        "reviews__reviewer",
     )

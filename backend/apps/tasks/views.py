@@ -289,30 +289,193 @@ class TaskViewSet(viewsets.ModelViewSet):
             return self.get_paginated_response(ProgressUpdateSerializer(page, many=True).data)
         return Response(ProgressUpdateSerializer(qs, many=True).data)
 
-    @action(detail=True, methods=["get", "post"])
+    @action(
+        detail=True,
+        methods=["get", "post"],
+        parser_classes=[MultiPartParser, FormParser, JSONParser],
+    )
     def reviews(self, request, pk=None):
         """
-        Paginated task review history endpoint per DB Design §8.
+        Paginated task review history & decision endpoint per DB Design §8 & SRS §14.2.
         """
         from apps.reviews.serializers import TaskReviewSerializer
 
         task = self.get_object()
+        is_auth = bool(getattr(request, "user", None) and request.user.is_authenticated)
         if request.method == "POST":
             data = request.data.copy()
             data["task"] = str(task.id)
-            serializer = TaskReviewSerializer(data=data)
+            uploaded = request.FILES.getlist("files") or request.FILES.getlist("file")
+            serializer = TaskReviewSerializer(
+                data=data,
+                context={
+                    "request": request,
+                    "enforce_actor_permission": is_auth,
+                    "uploaded_files": uploaded,
+                },
+            )
             serializer.is_valid(raise_exception=True)
             if "reviewer" not in serializer.validated_data:
-                serializer.save(reviewer=_default_user(request))
+                reviewer = (
+                    request.user
+                    if is_auth
+                    else (
+                        task.reviewer
+                        or task.project.project_manager
+                        or task.created_by
+                        or User.objects.first()
+                    )
+                )
+                serializer.save(reviewer=reviewer)
             else:
                 serializer.save()
             return Response(serializer.data, status=status.HTTP_201_CREATED)
 
-        qs = task.reviews.select_related("reviewer").order_by("-reviewed_at")
+        qs = (
+            task.reviews.select_related("reviewer", "task", "task__project")
+            .prefetch_related("task__comments__comment_attachments__attachment__uploaded_by")
+            .order_by("-reviewed_at", "-review_round")
+        )
         page = self.paginate_queryset(qs)
         if page is not None:
             return self.get_paginated_response(TaskReviewSerializer(page, many=True).data)
         return Response(TaskReviewSerializer(qs, many=True).data)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="submit-for-review",
+        parser_classes=[MultiPartParser, FormParser, JSONParser],
+    )
+    def submit_for_review(self, request, pk=None):
+        """
+        SRS §2.6, §7.3 & §14.1:
+        Submits a task for review, auto-resolving Step 1 reviewer from configured approval chain
+        and notifying the assigned reviewer.
+        """
+        from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
+        from apps.reviews.serializers import ReviewQueueTaskSerializer
+        from apps.reviews.services import submit_for_review_service
+
+        task = self.get_object()
+        is_auth = bool(getattr(request, "user", None) and request.user.is_authenticated)
+        actor = request.user if is_auth else (
+            User.objects.filter(id=request.data.get("actor")).first()
+            if request.data.get("actor")
+            else (task.task_owner or task.created_by)
+        )
+        attachment_ids = request.data.get("attachment_ids")
+        if isinstance(attachment_ids, str):
+            attachment_ids = [s.strip() for s in attachment_ids.split(",") if s.strip()]
+        elif hasattr(request.data, "getlist") and request.data.getlist("attachment_ids"):
+            attachment_ids = request.data.getlist("attachment_ids")
+        uploaded = request.FILES.getlist("files") or request.FILES.getlist("file")
+        raw_approval_req = request.data.get("approval_required")
+        approval_req = (
+            None
+            if raw_approval_req in (None, "")
+            else str(raw_approval_req).lower() in ("true", "1", "yes")
+        )
+        try:
+            submit_for_review_service(
+                task=task,
+                actor=actor,
+                reviewer_id=request.data.get("reviewer") or None,
+                notes=request.data.get("notes"),
+                attachment_ids=attachment_ids,
+                uploaded_files=uploaded,
+                approval_required=approval_req,
+            )
+        except DjangoPermissionDenied as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_403_FORBIDDEN)
+        except DjangoValidationError as exc:
+            msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+
+        refreshed = get_task_detail_queryset(request).get(pk=task.pk)
+        return Response(TaskDetailSerializer(refreshed).data)
+
+    @action(detail=True, methods=["post"], url_path="reassign-reviewer")
+    def reassign_reviewer(self, request, pk=None):
+        """
+        SRS §14.2: Reassigns reviewer on a task when permitted.
+        """
+        from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
+        from apps.reviews.services import reassign_reviewer_service
+
+        task = self.get_object()
+        is_auth = bool(getattr(request, "user", None) and request.user.is_authenticated)
+        actor = request.user if is_auth else (
+            User.objects.filter(id=request.data.get("actor")).first()
+            if request.data.get("actor")
+            else (task.project.project_manager or task.reviewer or task.created_by)
+        )
+        try:
+            reassign_reviewer_service(
+                task=task,
+                new_reviewer_id=request.data.get("new_reviewer") or request.data.get("reviewer"),
+                actor=actor,
+                reason=request.data.get("reason"),
+                enforce_actor_permission=is_auth,
+            )
+        except DjangoPermissionDenied as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_403_FORBIDDEN)
+        except DjangoValidationError as exc:
+            msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+
+        refreshed = get_task_detail_queryset(request).get(pk=task.pk)
+        return Response(TaskDetailSerializer(refreshed).data)
+
+    @action(detail=True, methods=["get", "post"], url_path="review-chain")
+    def review_chain(self, request, pk=None):
+        """
+        SRS §14.1–§14.4:
+        GET: Returns this task's live approval chain steps, SLA timer status, and review history.
+        POST: Updates this task's custom approval levels / user overrides.
+        """
+        from apps.reviews.serializers import TaskReviewSerializer
+        from apps.reviews.services import (
+            VALID_APPROVAL_LEVELS,
+            compute_task_review_sla,
+            configure_approval_chain_service,
+            resolve_task_approval_chain,
+        )
+
+        task = self.get_object()
+        if request.method == "POST":
+            is_auth = bool(getattr(request, "user", None) and request.user.is_authenticated)
+            actor = request.user if is_auth else None
+            try:
+                res = configure_approval_chain_service(
+                    scope="task",
+                    levels=request.data.get("levels", ["Reviewer"]),
+                    actor=actor,
+                    task=task,
+                    user_overrides=request.data.get("user_overrides"),
+                    escalation_hours=request.data.get("escalation_hours"),
+                )
+            except DjangoValidationError as exc:
+                msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
+                return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(res)
+
+        chain = resolve_task_approval_chain(task)
+        sla = compute_task_review_sla(task, threshold_hours=chain.get("escalation_hours"))
+        reviews_qs = (
+            task.reviews.select_related("reviewer", "task", "task__project")
+            .prefetch_related("task__comments__comment_attachments__attachment__uploaded_by")
+            .order_by("-reviewed_at", "-review_round")
+        )
+        return Response(
+            {
+                "task_id": str(task.id),
+                "valid_levels": list(VALID_APPROVAL_LEVELS),
+                "approval_chain": chain,
+                "sla": sla,
+                "reviews": TaskReviewSerializer(reviews_qs, many=True, context={"omit_chain": True}).data,
+            }
+        )
 
     @action(detail=True, methods=["get", "post"], url_path="time-entries")
     def time_entries(self, request, pk=None):

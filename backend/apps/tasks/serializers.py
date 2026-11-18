@@ -924,6 +924,9 @@ class TaskDetailSerializer(TaskSerializer):
     checklists = ChecklistSerializer(many=True, read_only=True)
     comments = serializers.SerializerMethodField()
     progress_updates = serializers.SerializerMethodField()
+    reviews = serializers.SerializerMethodField()
+    approval_chain = serializers.SerializerMethodField()
+    review_sla = serializers.SerializerMethodField()
     task_attachments = TaskAttachmentSerializer(many=True, read_only=True)
     history_endpoints = serializers.SerializerMethodField()
 
@@ -935,6 +938,9 @@ class TaskDetailSerializer(TaskSerializer):
             "checklists",
             "comments",
             "progress_updates",
+            "reviews",
+            "approval_chain",
+            "review_sla",
             "task_attachments",
             "history_endpoints",
         ]
@@ -950,10 +956,31 @@ class TaskDetailSerializer(TaskSerializer):
         recent_updates = obj.progress_updates.all()[:20]
         return ProgressUpdateSerializer(recent_updates, many=True).data
 
+    def get_reviews(self, obj):
+        from apps.reviews.serializers import TaskReviewSerializer
+
+        recent_reviews = sorted(
+            obj.reviews.all(),
+            key=lambda r: (r.review_round, r.reviewed_at),
+            reverse=True,
+        )[:20]
+        return TaskReviewSerializer(recent_reviews, many=True, context={"omit_chain": True}).data
+
+    def get_approval_chain(self, obj):
+        from apps.reviews.services import resolve_task_approval_chain
+
+        return resolve_task_approval_chain(obj)
+
+    def get_review_sla(self, obj):
+        from apps.reviews.services import compute_task_review_sla
+
+        return compute_task_review_sla(obj)
+
     def get_history_endpoints(self, obj):
         return {
             "comments": f"/api/tasks/{obj.id}/comments/",
             "progress_updates": f"/api/tasks/{obj.id}/progress-updates/",
             "reviews": f"/api/tasks/{obj.id}/reviews/",
+            "review_chain": f"/api/tasks/{obj.id}/review-chain/",
             "time_entries": f"/api/tasks/{obj.id}/time-entries/",
         }

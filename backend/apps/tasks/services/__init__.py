@@ -706,10 +706,11 @@ def get_allowed_next_statuses(*, task: Task, actor=None) -> list[str]:
     else:
         allowed = list(DEFAULT_TASK_TRANSITIONS.get(task.status, []))
 
-    # Enforce SRS §14.3: if approval_required and not yet approved, Completed is not directly reachable from In Progress
+    # Enforce SRS §14.3: if approval_required and not yet approved, Completed is not directly reachable
     if task.approval_required and Task.Status.COMPLETED in allowed:
-        has_approved_review = task.reviews.filter(decision="Approved").exists()
-        if not has_approved_review and task.status != Task.Status.APPROVED:
+        from apps.reviews.services import is_task_approval_satisfied
+
+        if not is_task_approval_satisfied(task) and task.status != Task.Status.APPROVED:
             allowed = [s for s in allowed if s != Task.Status.COMPLETED]
 
     # Deduplicate preserving order
@@ -747,12 +748,14 @@ def transition_task_status_service(
     # 1. Validate transition path (SRS §7.3 & §22 #5)
     allowed_next = get_allowed_next_statuses(task=task, actor=actor)
     if new_status not in allowed_next:
+        from apps.reviews.services import is_task_approval_satisfied
+
         # Also give a specific, helpful message if approval_required prevented direct completion
         if (
             new_status == Task.Status.COMPLETED
             and task.approval_required
             and old_status != Task.Status.APPROVED
-            and not task.reviews.filter(decision="Approved").exists()
+            and not is_task_approval_satisfied(task)
         ):
             raise ValidationError(
                 "Task requires approval before it can be marked Completed. Move it to 'In Review' and obtain approval first (SRS §14.3 & §22 #7)."
@@ -773,8 +776,9 @@ def transition_task_status_service(
     # 3. Enforce approval & subtask completion rules when completing (SRS §8.3, §14.3, §22 #7, #9)
     if new_status == Task.Status.COMPLETED:
         if task.approval_required:
-            has_approved_review = task.reviews.filter(decision="Approved").exists()
-            if not has_approved_review and old_status != Task.Status.APPROVED:
+            from apps.reviews.services import is_task_approval_satisfied
+
+            if not is_task_approval_satisfied(task) and old_status != Task.Status.APPROVED:
                 raise ValidationError(
                     "Task requires approval before it can be marked Completed (SRS §14.3 & §22 #7)."
                 )
@@ -796,6 +800,17 @@ def transition_task_status_service(
     elif old_status == Task.Status.COMPLETED and new_status != Task.Status.COMPLETED:
         # Reopening a completed task clears completed_at
         task.completed_at = None
+
+    # Auto-assign Step 1 reviewer from configured approval chain if moving to In Review without one
+    if new_status == Task.Status.IN_REVIEW and not task.reviewer_id:
+        from apps.reviews.services import resolve_task_approval_chain
+
+        chain = resolve_task_approval_chain(task)
+        first_rev_id = chain.get("current_reviewer_id") or (
+            chain["steps"][0]["user_id"] if chain["steps"] else None
+        )
+        if first_rev_id:
+            task.reviewer_id = first_rev_id
 
     task.status = new_status
     task.save()
