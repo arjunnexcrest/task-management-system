@@ -846,3 +846,16 @@ def transition_task_status_service(
 
     recalculate_project_progress_service(project=task.project)
     return task
+
+
+from .attachments import (  # noqa: E402,F401
+    ALLOWED_MIME_PREFIXES,
+    APPROVED_EXTENSIONS,
+    BLOCKED_EXECUTABLE_EXTENSIONS,
+    check_attachment_access_permission,
+    delete_attachment_service,
+    get_file_category,
+    remove_physical_file_if_unreferenced,
+    store_and_create_attachment_service,
+    validate_attachment_file,
+)

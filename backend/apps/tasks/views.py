@@ -1,10 +1,14 @@
+from pathlib import Path
+from django.conf import settings
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
+from django.http import HttpResponse
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 
 from apps.accounts.models import User
@@ -45,9 +49,13 @@ from .serializers import (
 from .services import (
     assign_task_service,
     bulk_assign_tasks_service,
+    check_attachment_access_permission,
+    delete_attachment_service,
     delete_task_service,
     get_allowed_next_statuses,
+    remove_physical_file_if_unreferenced,
     reschedule_task_service,
+    store_and_create_attachment_service,
     transition_task_status_service,
 )
 
@@ -331,6 +339,69 @@ class TaskViewSet(viewsets.ModelViewSet):
             return self.get_paginated_response(TimeEntrySerializer(page, many=True).data)
         return Response(TimeEntrySerializer(qs, many=True).data)
 
+    @action(
+        detail=True,
+        methods=["get", "post"],
+        parser_classes=[MultiPartParser, FormParser, JSONParser],
+    )
+    def attachments(self, request, pk=None):
+        """
+        SRS §7.8 & DB Design §4.5:
+        Lists or uploads single/multiple attachments directly associated with this task.
+        """
+        task = self.get_object()
+        if request.method == "POST":
+            uploader = _default_user(request, task=task)
+            uploaded_files = request.FILES.getlist("files") or request.FILES.getlist("file")
+            created_links = []
+            try:
+                with transaction.atomic():
+                    if uploaded_files:
+                        for uf in uploaded_files:
+                            att = store_and_create_attachment_service(
+                                uploaded_by=uploader,
+                                uploaded_file=uf,
+                                task=task,
+                            )
+                            link = TaskAttachment.objects.get(task=task, attachment=att)
+                            created_links.append(link)
+                    elif isinstance(request.data.get("files"), list) and request.data.get("files"):
+                        for item in request.data["files"]:
+                            att = store_and_create_attachment_service(
+                                uploaded_by=uploader,
+                                file_name=item.get("file_name"),
+                                mime_type=item.get("mime_type"),
+                                file_size_bytes=item.get("file_size_bytes"),
+                                file_content_base64=item.get("file_content_base64"),
+                                task=task,
+                            )
+                            link = TaskAttachment.objects.get(task=task, attachment=att)
+                            created_links.append(link)
+                    else:
+                        att = store_and_create_attachment_service(
+                            uploaded_by=uploader,
+                            file_name=request.data.get("file_name"),
+                            mime_type=request.data.get("mime_type"),
+                            file_size_bytes=request.data.get("file_size_bytes"),
+                            file_content_base64=request.data.get("file_content_base64"),
+                            task=task,
+                        )
+                        link = TaskAttachment.objects.get(task=task, attachment=att)
+                        created_links.append(link)
+            except DjangoValidationError as exc:
+                msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
+                return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+
+            return Response(
+                TaskAttachmentSerializer(created_links, many=True).data,
+                status=status.HTTP_201_CREATED,
+            )
+
+        qs = task.task_attachments.select_related("attachment", "attachment__uploaded_by").order_by(
+            "-attachment__uploaded_at"
+        )
+        return Response(TaskAttachmentSerializer(qs, many=True).data)
+
     @action(detail=False, methods=["get"])
     def kanban(self, request):
         tasks = self.filter_queryset(self.get_queryset().filter(parent_task__isnull=True))
@@ -518,28 +589,168 @@ class CommentMentionViewSet(viewsets.ModelViewSet):
 class AttachmentViewSet(viewsets.ModelViewSet):
     serializer_class = AttachmentSerializer
     permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ["uploaded_by", "mime_type"]
+    search_fields = ["file_name", "mime_type", "uploaded_by__full_name"]
+    ordering_fields = ["uploaded_at", "file_size_bytes", "file_name"]
 
     def get_queryset(self):
-        return Attachment.objects.select_related("uploaded_by").all()
+        return (
+            Attachment.objects.select_related("uploaded_by")
+            .prefetch_related("task_links__task__project", "comment_links", "progress_links")
+            .order_by("-uploaded_at")
+        )
 
     def perform_create(self, serializer):
         if "uploaded_by" not in serializer.validated_data:
-            serializer.save(uploaded_by=_default_user(self.request))
+            task_obj = serializer.validated_data.get("task")
+            serializer.save(uploaded_by=_default_user(self.request, task=task_obj))
         else:
             serializer.save()
+
+    def destroy(self, request, *args, **kwargs):
+        attachment = self.get_object()
+        delete_attachment_service(attachment=attachment, actor=getattr(request, "user", None))
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=False, methods=["post"])
+    def upload(self, request):
+        """
+        SRS §7.8 Multiple File Uploads & Association:
+        Accepts single or multiple files (`files` / `file` via multipart/form-data or JSON `files` list)
+        and links them to optional `task`, `comment`, and/or `progress_update`.
+        """
+        from apps.tracking.models import ProgressUpdate
+
+        task_id = request.data.get("task")
+        comment_id = request.data.get("comment")
+        progress_update_id = request.data.get("progress_update")
+
+        task_obj = Task.objects.select_related("project__company").filter(id=task_id).first() if task_id else None
+        comment_obj = (
+            TaskComment.objects.select_related("task__project__company").filter(id=comment_id).first()
+            if comment_id
+            else None
+        )
+        progress_obj = (
+            ProgressUpdate.objects.select_related("task__project__company").filter(id=progress_update_id).first()
+            if progress_update_id
+            else None
+        )
+
+        uploader_id = request.data.get("uploaded_by")
+        uploader = (
+            User.objects.filter(id=uploader_id).first()
+            if uploader_id
+            else _default_user(
+                request,
+                task=task_obj or (comment_obj.task if comment_obj else None) or (progress_obj.task if progress_obj else None),
+            )
+        )
+
+        uploaded_files = request.FILES.getlist("files") or request.FILES.getlist("file")
+        created_attachments = []
+        try:
+            with transaction.atomic():
+                if uploaded_files:
+                    for uf in uploaded_files:
+                        att = store_and_create_attachment_service(
+                            uploaded_by=uploader,
+                            uploaded_file=uf,
+                            task=task_obj,
+                            comment=comment_obj,
+                            progress_update=progress_obj,
+                        )
+                        created_attachments.append(att)
+                elif isinstance(request.data.get("files"), list) and request.data.get("files"):
+                    for item in request.data["files"]:
+                        att = store_and_create_attachment_service(
+                            uploaded_by=uploader,
+                            file_name=item.get("file_name"),
+                            mime_type=item.get("mime_type"),
+                            file_size_bytes=item.get("file_size_bytes"),
+                            file_content_base64=item.get("file_content_base64"),
+                            task=task_obj,
+                            comment=comment_obj,
+                            progress_update=progress_obj,
+                        )
+                        created_attachments.append(att)
+                else:
+                    att = store_and_create_attachment_service(
+                        uploaded_by=uploader,
+                        file_name=request.data.get("file_name"),
+                        mime_type=request.data.get("mime_type"),
+                        file_size_bytes=request.data.get("file_size_bytes"),
+                        file_content_base64=request.data.get("file_content_base64"),
+                        task=task_obj,
+                        comment=comment_obj,
+                        progress_update=progress_obj,
+                    )
+                    created_attachments.append(att)
+        except DjangoValidationError as exc:
+            msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(
+            {
+                "uploaded_count": len(created_attachments),
+                "attachments": AttachmentSerializer(created_attachments, many=True).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
     @action(detail=True, methods=["get"])
     def download(self, request, pk=None):
         """
-        Permission-checked download link endpoint (DB Design §6 & §7 Rule #9).
+        SRS §7.8 & DB Design §6 & §7 Rule #9:
+        Permission-checked download & inline preview endpoint.
+        - Validates company access permission.
+        - Streams actual file bytes from MEDIA_ROOT with Content-Disposition (`inline` or `attachment`)
+          and SHA-256 header when file exists on disk (unless `?meta=1` is requested).
         """
         attachment = self.get_object()
+        check_attachment_access_permission(attachment, getattr(request, "user", None))
+
+        if request.query_params.get("meta") == "1":
+            return Response(
+                {
+                    "id": attachment.id,
+                    "file_name": attachment.file_name,
+                    "mime_type": attachment.mime_type,
+                    "file_size_bytes": attachment.file_size_bytes,
+                    "checksum": attachment.checksum,
+                    "signed_download_url": f"/media/{attachment.storage_key}",
+                }
+            )
+
+        abs_path = Path(settings.MEDIA_ROOT) / attachment.storage_key
+        is_inline = request.query_params.get("inline") == "1"
+        disposition = "inline" if is_inline else "attachment"
+
+        if abs_path.exists() and abs_path.is_file():
+            content = abs_path.read_bytes()
+            resp = HttpResponse(content, content_type=attachment.mime_type or "application/octet-stream")
+            resp["Content-Disposition"] = f'{disposition}; filename="{attachment.file_name}"'
+            resp["Content-Length"] = str(len(content))
+            if attachment.checksum:
+                resp["X-Content-SHA256"] = attachment.checksum
+            return resp
+
+        if request.query_params.get("stream") == "1" or is_inline:
+            fallback_bytes = f"Attachment metadata: {attachment.file_name}".encode("utf-8")
+            resp = HttpResponse(fallback_bytes, content_type=attachment.mime_type or "application/octet-stream")
+            resp["Content-Disposition"] = f'{disposition}; filename="{attachment.file_name}"'
+            resp["Content-Length"] = str(len(fallback_bytes))
+            return resp
+
         return Response(
             {
                 "id": attachment.id,
                 "file_name": attachment.file_name,
                 "mime_type": attachment.mime_type,
                 "file_size_bytes": attachment.file_size_bytes,
+                "checksum": attachment.checksum,
                 "signed_download_url": f"/media/{attachment.storage_key}",
             }
         )
@@ -552,8 +763,24 @@ class TaskAttachmentViewSet(viewsets.ModelViewSet):
     filterset_fields = ["task", "attachment"]
 
     def get_queryset(self):
-        qs = TaskAttachment.objects.select_related("task", "task__project", "attachment", "attachment__uploaded_by").all()
+        qs = TaskAttachment.objects.select_related(
+            "task", "task__project", "attachment", "attachment__uploaded_by"
+        ).all()
         return scope_queryset_by_company(qs, self.request, company_lookup="task__project__company_id")
+
+    def perform_destroy(self, instance):
+        attachment = instance.attachment
+        check_attachment_access_permission(attachment, getattr(self.request, "user", None))
+        instance.delete()
+        if (
+            not attachment.task_links.exists()
+            and not attachment.comment_links.exists()
+            and not attachment.progress_links.exists()
+        ):
+            storage_key = attachment.storage_key
+            att_id = attachment.id
+            attachment.delete()
+            remove_physical_file_if_unreferenced(storage_key, exclude_attachment_id=att_id)
 
 
 class CommentAttachmentViewSet(viewsets.ModelViewSet):
@@ -567,3 +794,17 @@ class CommentAttachmentViewSet(viewsets.ModelViewSet):
             "comment", "comment__task__project", "attachment", "attachment__uploaded_by"
         ).all()
         return scope_queryset_by_company(qs, self.request, company_lookup="comment__task__project__company_id")
+
+    def perform_destroy(self, instance):
+        attachment = instance.attachment
+        check_attachment_access_permission(attachment, getattr(self.request, "user", None))
+        instance.delete()
+        if (
+            not attachment.task_links.exists()
+            and not attachment.comment_links.exists()
+            and not attachment.progress_links.exists()
+        ):
+            storage_key = attachment.storage_key
+            att_id = attachment.id
+            attachment.delete()
+            remove_physical_file_if_unreferenced(storage_key, exclude_attachment_id=att_id)

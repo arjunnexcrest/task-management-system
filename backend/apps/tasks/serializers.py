@@ -22,8 +22,11 @@ from .models import (
 )
 from .services import (
     get_allowed_next_statuses,
+    get_file_category,
+    store_and_create_attachment_service,
     sync_task_associations_service,
     transition_task_status_service,
+    validate_attachment_file,
 )
 
 ALLOWED_ATTACHMENT_MIME_PREFIXES = (
@@ -31,8 +34,10 @@ ALLOWED_ATTACHMENT_MIME_PREFIXES = (
     "application/msword",
     "application/vnd.",
     "image/",
+    "video/",
     "text/",
     "application/zip",
+    "application/x-zip-compressed",
     "application/json",
 )
 MAX_ATTACHMENT_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
@@ -217,14 +222,188 @@ class CommentMentionSerializer(CompanyScopedValidationMixin, serializers.ModelSe
         return attrs
 
 
+class AttachmentSerializer(serializers.ModelSerializer):
+    """
+    SRS §7.8 & DB Design §4.5, §5, §6 & §7 Rule #9:
+    - Supports multipart file upload (`file`), base64 upload (`file_content_base64`), or metadata registration.
+    - Validates approved extensions (JPG, JPEG, PNG, WEBP, PDF, DOCX, XLSX, PPTX, TXT, MP4, ZIP),
+      MIME types, and configurable file-size limits, rejecting dangerous executables.
+    - Does NOT expose raw unrestricted `storage_key` on read (`write_only=True`);
+      instead returns permission-checked `download_url`, `preview_url`, and `file_category`.
+    """
+
+    uploaded_by_name = serializers.CharField(source="uploaded_by.full_name", read_only=True)
+    download_url = serializers.SerializerMethodField()
+    preview_url = serializers.SerializerMethodField()
+    file_category = serializers.SerializerMethodField()
+
+    file = serializers.FileField(required=False, write_only=True)
+    file_content_base64 = serializers.CharField(
+        required=False, allow_blank=True, write_only=True
+    )
+    task = serializers.PrimaryKeyRelatedField(
+        queryset=Task.objects.all(), required=False, allow_null=True, write_only=True
+    )
+    comment = serializers.PrimaryKeyRelatedField(
+        queryset=TaskComment.objects.all(), required=False, allow_null=True, write_only=True
+    )
+
+    class Meta:
+        model = Attachment
+        fields = [
+            "id",
+            "uploaded_by",
+            "uploaded_by_name",
+            "file_name",
+            "storage_key",
+            "download_url",
+            "preview_url",
+            "file_category",
+            "mime_type",
+            "file_size_bytes",
+            "checksum",
+            "uploaded_at",
+            "file",
+            "file_content_base64",
+            "task",
+            "comment",
+        ]
+        read_only_fields = ["id", "uploaded_at", "download_url", "preview_url", "file_category"]
+        extra_kwargs = {
+            "storage_key": {"write_only": True, "required": False},
+            "uploaded_by": {"required": False},
+            "file_name": {"required": False},
+            "mime_type": {"required": False},
+            "file_size_bytes": {"required": False},
+        }
+
+    def get_download_url(self, obj):
+        return f"/api/tasks/attachments/{obj.id}/download/"
+
+    def get_preview_url(self, obj):
+        return f"/api/tasks/attachments/{obj.id}/download/?inline=1"
+
+    def get_file_category(self, obj):
+        return get_file_category(obj.file_name, obj.mime_type)
+
+    def validate(self, attrs):
+        uploaded_file = attrs.get("file")
+        b64_content = attrs.get("file_content_base64")
+        file_name = attrs.get("file_name") or (getattr(uploaded_file, "name", None) if uploaded_file else None)
+        mime_type = attrs.get("mime_type") or (
+            getattr(uploaded_file, "content_type", None) if uploaded_file else None
+        )
+        file_size = attrs.get("file_size_bytes")
+        if uploaded_file is not None and file_size is None:
+            file_size = getattr(uploaded_file, "size", 0)
+        elif b64_content and file_size is None:
+            payload = b64_content.split(",", 1)[-1]
+            file_size = max(1, int(len(payload) * 3 / 4))
+
+        task_obj = attrs.get("task")
+        comment_obj = attrs.get("comment")
+        company = None
+        if task_obj:
+            company = task_obj.project.company
+        elif comment_obj:
+            company = comment_obj.task.project.company
+
+        try:
+            validate_attachment_file(
+                file_name=file_name or "",
+                mime_type=mime_type or "",
+                file_size_bytes=file_size if file_size is not None else 0,
+                company=company,
+            )
+        except DjangoValidationError as exc:
+            msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
+            raise serializers.ValidationError({"detail": msg})
+
+        return attrs
+
+    @transaction.atomic
+    def create(self, validated_data):
+        uploaded_file = validated_data.pop("file", None)
+        b64_content = validated_data.pop("file_content_base64", None)
+        task_obj = validated_data.pop("task", None)
+        comment_obj = validated_data.pop("comment", None)
+        uploaded_by = validated_data.get("uploaded_by")
+        if not uploaded_by:
+            request = self.context.get("request")
+            if request and getattr(request, "user", None) and request.user.is_authenticated:
+                uploaded_by = request.user
+            elif task_obj:
+                uploaded_by = task_obj.task_owner or task_obj.created_by
+            elif comment_obj:
+                uploaded_by = comment_obj.author
+            else:
+                uploaded_by = User.objects.first()
+
+        try:
+            if uploaded_file is not None or b64_content:
+                return store_and_create_attachment_service(
+                    uploaded_by=uploaded_by,
+                    uploaded_file=uploaded_file,
+                    file_name=validated_data.get("file_name"),
+                    mime_type=validated_data.get("mime_type"),
+                    file_size_bytes=validated_data.get("file_size_bytes"),
+                    file_content_base64=b64_content,
+                    task=task_obj,
+                    comment=comment_obj,
+                )
+
+            # Metadata registration path (e.g., external storage key provided directly)
+            if not validated_data.get("storage_key"):
+                validated_data["storage_key"] = f"attachments/{validated_data.get('file_name', 'file')}"
+            validated_data["uploaded_by"] = uploaded_by
+            attachment = super().create(validated_data)
+            if comment_obj is not None:
+                CommentAttachment.objects.get_or_create(comment=comment_obj, attachment=attachment)
+                if task_obj is None:
+                    task_obj = comment_obj.task
+            if task_obj is not None:
+                TaskAttachment.objects.get_or_create(task=task_obj, attachment=attachment)
+            return attachment
+        except DjangoValidationError as exc:
+            msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
+            raise serializers.ValidationError({"detail": msg})
+
+
+class TaskAttachmentSerializer(serializers.ModelSerializer):
+    attachment_detail = AttachmentSerializer(source="attachment", read_only=True)
+
+    class Meta:
+        model = TaskAttachment
+        fields = ["id", "task", "attachment", "attachment_detail"]
+        read_only_fields = ["id"]
+
+
+class CommentAttachmentSerializer(serializers.ModelSerializer):
+    attachment_detail = AttachmentSerializer(source="attachment", read_only=True)
+
+    class Meta:
+        model = CommentAttachment
+        fields = ["id", "comment", "attachment", "attachment_detail"]
+        read_only_fields = ["id"]
+
+
 class TaskCommentSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
     author_name = serializers.CharField(source="author.full_name", read_only=True)
     mentions = CommentMentionSerializer(many=True, read_only=True)
+    attachments = CommentAttachmentSerializer(
+        source="comment_attachments", many=True, read_only=True
+    )
     mentioned_user_ids = serializers.ListField(
         child=serializers.UUIDField(),
         required=False,
         write_only=True,
         help_text="List of authorized company User UUIDs mentioned in this comment.",
+    )
+    attachment_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        write_only=True,
+        help_text="Optional list of Attachment UUIDs to attach to this comment (SRS §7.7).",
     )
     replies_count = serializers.SerializerMethodField()
 
@@ -239,6 +418,8 @@ class TaskCommentSerializer(CompanyScopedValidationMixin, serializers.ModelSeria
             "content",
             "mentions",
             "mentioned_user_ids",
+            "attachments",
+            "attachment_ids",
             "replies_count",
             "created_at",
             "updated_at",
@@ -280,82 +461,32 @@ class TaskCommentSerializer(CompanyScopedValidationMixin, serializers.ModelSeria
                     related_task=comment.task,
                 )
 
+    def _sync_attachments(self, comment: TaskComment, attachment_ids):
+        if not attachment_ids:
+            return
+        for aid in {str(a) for a in attachment_ids if a}:
+            att = Attachment.objects.filter(id=aid).first()
+            if att:
+                CommentAttachment.objects.get_or_create(comment=comment, attachment=att)
+                TaskAttachment.objects.get_or_create(task=comment.task, attachment=att)
+
     @transaction.atomic
     def create(self, validated_data):
         mentioned_user_ids = validated_data.pop("mentioned_user_ids", None)
+        attachment_ids = validated_data.pop("attachment_ids", None)
         comment = super().create(validated_data)
         self._sync_mentions(comment, mentioned_user_ids)
+        self._sync_attachments(comment, attachment_ids)
         return comment
 
     @transaction.atomic
     def update(self, instance, validated_data):
         mentioned_user_ids = validated_data.pop("mentioned_user_ids", None)
+        attachment_ids = validated_data.pop("attachment_ids", None)
         comment = super().update(instance, validated_data)
         self._sync_mentions(comment, mentioned_user_ids)
+        self._sync_attachments(comment, attachment_ids)
         return comment
-
-
-class AttachmentSerializer(serializers.ModelSerializer):
-    """
-    Per DB Design §5 & §7 Rule #9:
-    - Validates MIME type and file size on upload.
-    - Does NOT expose raw unrestricted `storage_key` on read (`write_only=True`);
-      instead returns a permission-checked `download_url`.
-    """
-
-    uploaded_by_name = serializers.CharField(source="uploaded_by.full_name", read_only=True)
-    download_url = serializers.SerializerMethodField()
-
-    class Meta:
-        model = Attachment
-        fields = [
-            "id",
-            "uploaded_by",
-            "uploaded_by_name",
-            "file_name",
-            "storage_key",
-            "download_url",
-            "mime_type",
-            "file_size_bytes",
-            "checksum",
-            "uploaded_at",
-        ]
-        read_only_fields = ["id", "uploaded_at", "download_url"]
-        extra_kwargs = {
-            "storage_key": {"write_only": True},
-            "uploaded_by": {"required": False},
-        }
-
-    def get_download_url(self, obj):
-        return f"/api/tasks/attachments/{obj.id}/download/"
-
-    def validate_mime_type(self, value):
-        if not value or not value.startswith(ALLOWED_ATTACHMENT_MIME_PREFIXES):
-            raise serializers.ValidationError(f"Unsupported MIME type '{value}'.")
-        return value
-
-    def validate_file_size_bytes(self, value):
-        if value <= 0 or value > MAX_ATTACHMENT_SIZE_BYTES:
-            raise serializers.ValidationError("File size must be between 1 byte and 50 MB.")
-        return value
-
-
-class TaskAttachmentSerializer(serializers.ModelSerializer):
-    attachment_detail = AttachmentSerializer(source="attachment", read_only=True)
-
-    class Meta:
-        model = TaskAttachment
-        fields = ["id", "task", "attachment", "attachment_detail"]
-        read_only_fields = ["id"]
-
-
-class CommentAttachmentSerializer(serializers.ModelSerializer):
-    attachment_detail = AttachmentSerializer(source="attachment", read_only=True)
-
-    class Meta:
-        model = CommentAttachment
-        fields = ["id", "comment", "attachment", "attachment_detail"]
-        read_only_fields = ["id"]
 
 
 class SubtaskNestedSerializer(serializers.ModelSerializer):
