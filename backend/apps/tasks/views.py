@@ -1,8 +1,10 @@
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import transaction
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 
 from apps.accounts.models import User
@@ -408,6 +410,29 @@ class ChecklistViewSet(viewsets.ModelViewSet):
         else:
             serializer.save()
 
+    @action(detail=True, methods=["post"])
+    def reorder_items(self, request, pk=None):
+        """
+        SRS §8.4: Reorders checklist items according to the supplied item_ids sequence.
+        """
+        checklist = self.get_object()
+        item_ids = request.data.get("item_ids", [])
+        if not isinstance(item_ids, list) or not item_ids:
+            return Response(
+                {"error": "Provide a non-empty list of item_ids to reorder."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        with transaction.atomic():
+            items_by_id = {str(it.id): it for it in checklist.items.all()}
+            order = 1
+            for raw_id in item_ids:
+                it = items_by_id.get(str(raw_id))
+                if it:
+                    ChecklistItem.objects.filter(id=it.id).update(sort_order=order)
+                    order += 1
+        checklist.refresh_from_db()
+        return Response(ChecklistSerializer(checklist).data)
+
 
 class ChecklistItemViewSet(viewsets.ModelViewSet):
     serializer_class = ChecklistItemSerializer
@@ -418,6 +443,11 @@ class ChecklistItemViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         qs = ChecklistItem.objects.select_related("checklist", "checklist__task__project", "completed_by").all()
         return scope_queryset_by_company(qs, self.request, company_lookup="checklist__task__project__company_id")
+
+    def perform_destroy(self, instance):
+        task = instance.checklist.task
+        instance.delete()
+        task.recalculate_auto_progress()
 
     @action(detail=True, methods=["post"])
     def toggle(self, request, pk=None):
@@ -441,7 +471,7 @@ class TaskCommentViewSet(viewsets.ModelViewSet):
         qs = (
             TaskComment.objects.select_related("task", "task__project", "author")
             .prefetch_related("mentions__mentioned_user")
-            .order_by("-created_at")
+            .order_by("created_at")
         )
         return scope_queryset_by_company(qs, self.request, company_lookup="task__project__company_id")
 
@@ -450,6 +480,19 @@ class TaskCommentViewSet(viewsets.ModelViewSet):
             serializer.save(author=_default_user(self.request))
         else:
             serializer.save()
+
+    def perform_update(self, serializer):
+        comment = self.get_object()
+        user = getattr(self.request, "user", None)
+        if user and user.is_authenticated and not user.is_superuser and comment.author_id != user.id:
+            raise PermissionDenied("You can only edit your own comments (SRS §7.7).")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        user = getattr(self.request, "user", None)
+        if user and user.is_authenticated and not user.is_superuser and instance.author_id != user.id:
+            raise PermissionDenied("You can only delete your own comments (SRS §7.7).")
+        instance.delete()
 
 
 class CommentMentionViewSet(viewsets.ModelViewSet):

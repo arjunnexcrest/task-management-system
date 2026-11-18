@@ -4,6 +4,7 @@ from django.utils import timezone
 from rest_framework import serializers
 from apps.accounts.models import User
 from apps.common.serializers import CompanyScopedValidationMixin
+from apps.notifications.models import Notification
 from apps.organization.models import Team
 from .models import (
     Attachment,
@@ -216,9 +217,16 @@ class CommentMentionSerializer(CompanyScopedValidationMixin, serializers.ModelSe
         return attrs
 
 
-class TaskCommentSerializer(serializers.ModelSerializer):
+class TaskCommentSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
     author_name = serializers.CharField(source="author.full_name", read_only=True)
     mentions = CommentMentionSerializer(many=True, read_only=True)
+    mentioned_user_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        write_only=True,
+        help_text="List of authorized company User UUIDs mentioned in this comment.",
+    )
+    replies_count = serializers.SerializerMethodField()
 
     class Meta:
         model = TaskComment
@@ -230,18 +238,61 @@ class TaskCommentSerializer(serializers.ModelSerializer):
             "parent_comment",
             "content",
             "mentions",
+            "mentioned_user_ids",
+            "replies_count",
             "created_at",
             "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
         extra_kwargs = {"author": {"required": False}}
 
+    def get_replies_count(self, obj):
+        return obj.replies.count()
+
     def validate(self, attrs):
         task = attrs.get("task") or getattr(self.instance, "task", None)
         parent_comment = attrs.get("parent_comment")
         if task and parent_comment and parent_comment.task_id != task.id:
             raise serializers.ValidationError("Parent comment must belong to the same task.")
+        if task and "mentioned_user_ids" in attrs and attrs["mentioned_user_ids"]:
+            for u_obj in User.objects.filter(id__in=attrs["mentioned_user_ids"]):
+                self.validate_user_in_company(
+                    u_obj, task.project.company, field_label="Mentioned user"
+                )
         return attrs
+
+    def _sync_mentions(self, comment: TaskComment, mentioned_user_ids):
+        if mentioned_user_ids is None:
+            return
+        unique_ids = {str(uid) for uid in mentioned_user_ids if uid}
+        for uid_str in unique_ids:
+            _, created = CommentMention.objects.get_or_create(
+                comment=comment,
+                mentioned_user_id=uid_str,
+            )
+            if created and str(comment.author_id) != uid_str:
+                Notification.objects.create(
+                    user_id=uid_str,
+                    notification_type="COMMENT_MENTION",
+                    title=f"Mentioned in Task: {comment.task.title}",
+                    message=f"{comment.author.full_name} mentioned you: \"{comment.content[:120]}\"",
+                    related_project=comment.task.project,
+                    related_task=comment.task,
+                )
+
+    @transaction.atomic
+    def create(self, validated_data):
+        mentioned_user_ids = validated_data.pop("mentioned_user_ids", None)
+        comment = super().create(validated_data)
+        self._sync_mentions(comment, mentioned_user_ids)
+        return comment
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        mentioned_user_ids = validated_data.pop("mentioned_user_ids", None)
+        comment = super().update(instance, validated_data)
+        self._sync_mentions(comment, mentioned_user_ids)
+        return comment
 
 
 class AttachmentSerializer(serializers.ModelSerializer):
@@ -499,6 +550,29 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
                                 {"parent_task": "Circular parent-subtask relationship detected."}
                             )
                         anc = anc.parent_task
+
+                # Enforce configurable subtask nesting depth limit (SRS §8.1 & §20.2)
+                from apps.system_settings.models import SystemSetting
+
+                depth_setting = (
+                    SystemSetting.objects.filter(company=company, setting_key="subtask_max_depth").first()
+                    or SystemSetting.objects.filter(company__isnull=True, setting_key="subtask_max_depth").first()
+                )
+                max_depth = 3
+                if depth_setting and isinstance(depth_setting.setting_value, (int, str)):
+                    try:
+                        max_depth = int(depth_setting.setting_value)
+                    except (TypeError, ValueError):
+                        max_depth = 3
+                depth = 1
+                curr = parent_task.parent_task
+                while curr is not None:
+                    depth += 1
+                    curr = curr.parent_task
+                if depth > max_depth:
+                    raise serializers.ValidationError(
+                        {"parent_task": f"Subtask nesting depth cannot exceed the configured limit of {max_depth} level(s) (SRS §8.1)."}
+                    )
 
             if phase and phase.project_id != project.id:
                 raise serializers.ValidationError(
