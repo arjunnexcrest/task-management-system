@@ -1,3 +1,4 @@
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.utils import timezone
 from rest_framework import serializers
@@ -18,7 +19,11 @@ from .models import (
     TaskTag,
     TaskTagAssignment,
 )
-from .services import sync_task_associations_service
+from .services import (
+    get_allowed_next_statuses,
+    sync_task_associations_service,
+    transition_task_status_service,
+)
 
 ALLOWED_ATTACHMENT_MIME_PREFIXES = (
     "application/pdf",
@@ -343,6 +348,7 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
     is_overdue = serializers.SerializerMethodField()
     days_remaining = serializers.SerializerMethodField()
     due_status = serializers.SerializerMethodField()
+    allowed_transitions = serializers.SerializerMethodField()
     subtasks_count = serializers.SerializerMethodField()
     actual_effort_hours = serializers.SerializerMethodField()
     active_assignments = serializers.SerializerMethodField()
@@ -419,6 +425,7 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
             "is_overdue",
             "days_remaining",
             "due_status",
+            "allowed_transitions",
             "subtasks_count",
             "active_assignments",
             "tags",
@@ -585,12 +592,32 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
     def update(self, instance, validated_data):
         assoc = self._extract_association_fields(validated_data)
         assoc.pop("initial_checklist_items", None)
+
+        requested_status = validated_data.pop("status", None)
         task = super().update(instance, validated_data)
         sync_task_associations_service(
             task=task,
             actor_id=task.created_by_id,
             **assoc,
         )
+
+        if requested_status and requested_status != task.status:
+            request = self.context.get("request")
+            actor = (
+                request.user
+                if request and getattr(request, "user", None) and request.user.is_authenticated
+                else task.created_by
+            )
+            try:
+                transition_task_status_service(
+                    task=task,
+                    new_status=requested_status,
+                    actor=actor,
+                )
+            except DjangoValidationError as exc:
+                msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
+                raise serializers.ValidationError({"status": msg})
+
         from apps.projects.services import recalculate_project_progress_service
 
         recalculate_project_progress_service(project=task.project)
@@ -637,6 +664,9 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
         if diff <= 3:
             return "Due Soon"
         return "On Track"
+
+    def get_allowed_transitions(self, obj):
+        return get_allowed_next_statuses(task=obj)
 
     def get_subtasks_count(self, obj):
         if hasattr(obj, "annotated_subtasks_count"):

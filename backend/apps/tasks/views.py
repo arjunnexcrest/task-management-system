@@ -44,6 +44,7 @@ from .services import (
     assign_task_service,
     bulk_assign_tasks_service,
     delete_task_service,
+    get_allowed_next_statuses,
     reschedule_task_service,
     transition_task_status_service,
 )
@@ -167,10 +168,29 @@ class TaskViewSet(viewsets.ModelViewSet):
         refreshed = get_task_detail_queryset(request).get(pk=updated.pk)
         return Response(TaskDetailSerializer(refreshed).data)
 
+    @action(detail=True, methods=["get"], url_path="allowed-transitions")
+    def allowed_transitions(self, request, pk=None):
+        """
+        SRS §7.3 & §20.2:
+        Returns the permitted next workflow statuses for this task.
+        """
+        task = self.get_object()
+        return Response(
+            {
+                "task_id": str(task.id),
+                "current_status": task.status,
+                "allowed_transitions": get_allowed_next_statuses(
+                    task=task, actor=_default_user(request)
+                ),
+            }
+        )
+
     @action(detail=True, methods=["post"], url_path="transition-status")
     def transition_status(self, request, pk=None):
         """
-        Atomically transitions task status with approval and subtask checks (DB Design §4.6 & §7).
+        SRS §7.3, §8.3, §14.3 & §22:
+        Atomically transitions task status while validating permitted workflow paths,
+        responsible owner, required approvals, and subtask completion / authorized overrides.
         """
         task = self.get_object()
         new_status = request.data.get("status")
@@ -179,11 +199,15 @@ class TaskViewSet(viewsets.ModelViewSet):
                 task=task,
                 new_status=new_status,
                 actor=_default_user(request),
+                reason=request.data.get("reason"),
+                override_subtasks=bool(request.data.get("override_subtasks", False)),
+                override_reason=request.data.get("override_reason"),
             )
         except DjangoValidationError as exc:
             msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
             return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
-        return Response(TaskDetailSerializer(updated).data)
+        refreshed = get_task_detail_queryset(request).get(pk=updated.pk)
+        return Response(TaskDetailSerializer(refreshed).data)
 
     @action(detail=True, methods=["get"])
     def subtasks(self, request, pk=None):

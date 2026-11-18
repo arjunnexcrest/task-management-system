@@ -603,35 +603,244 @@ def delete_task_service(*, task: Task) -> None:
     recalculate_project_progress_service(project=project)
 
 
-@transaction.atomic
-def transition_task_status_service(*, task: Task, new_status: str, actor=None) -> Task:
+DEFAULT_TASK_TRANSITIONS: dict[str, list[str]] = {
+    Task.Status.BACKLOG: [
+        Task.Status.TO_DO,
+        Task.Status.ASSIGNED,
+        Task.Status.IN_PROGRESS,
+        Task.Status.CANCELLED,
+    ],
+    Task.Status.TO_DO: [
+        Task.Status.BACKLOG,
+        Task.Status.ASSIGNED,
+        Task.Status.IN_PROGRESS,
+        Task.Status.ON_HOLD,
+        Task.Status.BLOCKED,
+        Task.Status.CANCELLED,
+    ],
+    Task.Status.ASSIGNED: [
+        Task.Status.TO_DO,
+        Task.Status.IN_PROGRESS,
+        Task.Status.ON_HOLD,
+        Task.Status.BLOCKED,
+        Task.Status.CANCELLED,
+    ],
+    Task.Status.IN_PROGRESS: [
+        Task.Status.ASSIGNED,
+        Task.Status.ON_HOLD,
+        Task.Status.BLOCKED,
+        Task.Status.IN_REVIEW,
+        Task.Status.COMPLETED,
+        Task.Status.CANCELLED,
+    ],
+    Task.Status.ON_HOLD: [
+        Task.Status.TO_DO,
+        Task.Status.ASSIGNED,
+        Task.Status.IN_PROGRESS,
+        Task.Status.BLOCKED,
+        Task.Status.CANCELLED,
+    ],
+    Task.Status.BLOCKED: [
+        Task.Status.TO_DO,
+        Task.Status.ASSIGNED,
+        Task.Status.IN_PROGRESS,
+        Task.Status.ON_HOLD,
+        Task.Status.CANCELLED,
+    ],
+    Task.Status.IN_REVIEW: [
+        Task.Status.CHANGES_REQUESTED,
+        Task.Status.APPROVED,
+        Task.Status.IN_PROGRESS,
+        Task.Status.BLOCKED,
+        Task.Status.ON_HOLD,
+        Task.Status.CANCELLED,
+    ],
+    Task.Status.CHANGES_REQUESTED: [
+        Task.Status.IN_PROGRESS,
+        Task.Status.IN_REVIEW,
+        Task.Status.ON_HOLD,
+        Task.Status.BLOCKED,
+        Task.Status.CANCELLED,
+    ],
+    Task.Status.APPROVED: [
+        Task.Status.COMPLETED,
+        Task.Status.IN_REVIEW,
+        Task.Status.CHANGES_REQUESTED,
+    ],
+    Task.Status.COMPLETED: [
+        Task.Status.IN_PROGRESS,
+        Task.Status.IN_REVIEW,
+    ],
+    Task.Status.CANCELLED: [
+        Task.Status.BACKLOG,
+        Task.Status.TO_DO,
+    ],
+}
+
+
+def get_allowed_next_statuses(*, task: Task, actor=None) -> list[str]:
     """
-    Atomically transitions a task's workflow status while enforcing review/approval
-    and blocker rules (DB Design §4.6 & §7 Rule #7).
+    SRS §7.3, §20.2 & DB Design §4.7 (`workflow_statuses`, `workflow_transitions`):
+    Resolves permitted next statuses from company-scoped or global WorkflowTransition rows
+    if configured, otherwise falls back to SRS §7.3 DEFAULT_TASK_TRANSITIONS.
+    """
+    from apps.system_settings.models import WorkflowTransition
+
+    company_id = task.project.company_id
+    configured_qs = WorkflowTransition.objects.filter(
+        entity_type__iexact="Task",
+        company_id=company_id,
+    ).select_related("from_status", "to_status", "role")
+
+    if not configured_qs.exists():
+        configured_qs = WorkflowTransition.objects.filter(
+            entity_type__iexact="Task",
+            company__isnull=True,
+        ).select_related("from_status", "to_status", "role")
+
+    if configured_qs.exists():
+        outgoing = [
+            tr for tr in configured_qs if tr.from_status.status_code == task.status and tr.to_status.is_active
+        ]
+        allowed = [tr.to_status.status_code for tr in outgoing]
+    else:
+        allowed = list(DEFAULT_TASK_TRANSITIONS.get(task.status, []))
+
+    # Enforce SRS §14.3: if approval_required and not yet approved, Completed is not directly reachable from In Progress
+    if task.approval_required and Task.Status.COMPLETED in allowed:
+        has_approved_review = task.reviews.filter(decision="Approved").exists()
+        if not has_approved_review and task.status != Task.Status.APPROVED:
+            allowed = [s for s in allowed if s != Task.Status.COMPLETED]
+
+    # Deduplicate preserving order
+    seen = set()
+    return [s for s in allowed if not (s in seen or seen.add(s))]
+
+
+@transaction.atomic
+def transition_task_status_service(
+    *,
+    task: Task,
+    new_status: str,
+    actor=None,
+    reason: str | None = None,
+    override_subtasks: bool = False,
+    override_reason: str | None = None,
+) -> Task:
+    """
+    SRS §7.3, §8.3, §12.2, §14.3 & §22 Core Business Rules #3, #5, #7, #9:
+    Atomically transitions a task's workflow status while validating:
+    1. Permitted transition path (configured WorkflowTransition or SRS §7.3 defaults)
+    2. Responsible owner / active assignee before active execution
+    3. Required review/approval before Completed
+    4. Mandatory subtask completion before parent completion (unless authorized override with reason)
+    5. Traceable status-change comment, notifications, and progress recalculation
     """
     valid_statuses = {choice[0] for choice in Task.Status.choices}
     if new_status not in valid_statuses:
         raise ValidationError(f"Invalid status '{new_status}'.")
 
+    old_status = task.status
+    if new_status == old_status:
+        return task
+
+    # 1. Validate transition path (SRS §7.3 & §22 #5)
+    allowed_next = get_allowed_next_statuses(task=task, actor=actor)
+    if new_status not in allowed_next:
+        # Also give a specific, helpful message if approval_required prevented direct completion
+        if (
+            new_status == Task.Status.COMPLETED
+            and task.approval_required
+            and old_status != Task.Status.APPROVED
+            and not task.reviews.filter(decision="Approved").exists()
+        ):
+            raise ValidationError(
+                "Task requires approval before it can be marked Completed. Move it to 'In Review' and obtain approval first (SRS §14.3 & §22 #7)."
+            )
+        allowed_label = ", ".join(allowed_next) if allowed_next else "None"
+        raise ValidationError(
+            f"Invalid status transition from '{old_status}' to '{new_status}'. Permitted next statuses: {allowed_label} (SRS §7.3 & §22 #5)."
+        )
+
+    # 2. Enforce responsible owner / active assignee before active execution (SRS §22 #3)
+    if new_status in (Task.Status.IN_PROGRESS, Task.Status.IN_REVIEW, Task.Status.COMPLETED):
+        has_active_assignment = task.assignments.filter(status__in=["Active", "Acknowledged"]).exists()
+        if not task.task_owner_id and not has_active_assignment:
+            raise ValidationError(
+                f"Task must have a responsible Task Owner or active assignee before moving to '{new_status}' (SRS §22 #3)."
+            )
+
+    # 3. Enforce approval & subtask completion rules when completing (SRS §8.3, §14.3, §22 #7, #9)
     if new_status == Task.Status.COMPLETED:
         if task.approval_required:
             has_approved_review = task.reviews.filter(decision="Approved").exists()
-            if not has_approved_review and task.status != Task.Status.APPROVED:
+            if not has_approved_review and old_status != Task.Status.APPROVED:
                 raise ValidationError(
-                    "Task requires approval before it can be marked Completed (DB Design §4.6)."
+                    "Task requires approval before it can be marked Completed (SRS §14.3 & §22 #7)."
                 )
         incomplete_subtasks = task.subtasks.exclude(
             status__in=[Task.Status.COMPLETED, Task.Status.CANCELLED]
         ).count()
         if incomplete_subtasks > 0:
-            raise ValidationError(
-                f"Cannot complete task while {incomplete_subtasks} subtasks are still open."
-            )
+            if override_subtasks:
+                if not (override_reason and override_reason.strip()):
+                    raise ValidationError(
+                        "An authorized override reason is required to complete a task with open subtasks (SRS §8.3 & §22 #9)."
+                    )
+            else:
+                raise ValidationError(
+                    f"Cannot complete task while {incomplete_subtasks} subtask(s) are still open. Complete subtasks first or provide an authorized override reason (SRS §8.3 & §22 #9)."
+                )
         task.completed_at = timezone.now()
         task.progress = 100.00
+    elif old_status == Task.Status.COMPLETED and new_status != Task.Status.COMPLETED:
+        # Reopening a completed task clears completed_at
+        task.completed_at = None
 
     task.status = new_status
     task.save()
+
+    # 4. Traceable status transition comment (SRS §7.7 & §22 #6)
+    author_id = getattr(actor, "id", None) or task.created_by_id
+    note_parts = [f"[Status Transition] {old_status} → {new_status}"]
+    if reason and reason.strip():
+        note_parts.append(f"Reason: {reason.strip()}")
+    if override_subtasks and override_reason and override_reason.strip():
+        note_parts.append(f"Subtask Override: {override_reason.strip()}")
+    TaskComment.objects.create(
+        task=task,
+        author_id=author_id,
+        content=" | ".join(note_parts),
+    )
+
+    # 5. Relevant notifications (SRS §13.1 & §22 #17)
+    if new_status == Task.Status.IN_REVIEW and task.reviewer_id:
+        Notification.objects.create(
+            user_id=task.reviewer_id,
+            notification_type="REVIEW_REQUESTED",
+            title=f"Review Requested: {task.title}",
+            message=f"Task '{task.title}' has been submitted for review.",
+            related_project=task.project,
+            related_task=task,
+        )
+    elif new_status == Task.Status.CHANGES_REQUESTED and task.task_owner_id:
+        Notification.objects.create(
+            user_id=task.task_owner_id,
+            notification_type="CHANGES_REQUESTED",
+            title=f"Changes Requested: {task.title}",
+            message=f"Corrections were requested for task '{task.title}'.",
+            related_project=task.project,
+            related_task=task,
+        )
+    elif task.task_owner_id and task.task_owner_id != author_id:
+        Notification.objects.create(
+            user_id=task.task_owner_id,
+            notification_type="STATUS_CHANGED",
+            title=f"Task Status Updated: {task.title}",
+            message=f"Task '{task.title}' moved from {old_status} to {new_status}.",
+            related_project=task.project,
+            related_task=task,
+        )
 
     from apps.projects.services import recalculate_project_progress_service
 
