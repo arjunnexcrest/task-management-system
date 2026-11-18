@@ -188,6 +188,8 @@ urlpatterns = [
         SpectacularRedocView.as_view(url_name="schema"),
         name="redoc",
     ),
+    # Auth & Accounts APIs
+    path("api/auth/", include("apps.accounts.urls")),
     # All 13 SRS & Database Design Module APIs Wired
     path("api/accounts/", include("apps.accounts.urls")),
     path("api/companies/", include("apps.companies.urls")),
