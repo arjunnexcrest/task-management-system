@@ -46,7 +46,6 @@ class M2ProjectTaskEndToEndIntegrationTestCase(APITestCase):
         self.company = Company.objects.create(
             name="M2 Enterprise Corp",
             code="M2-CORP",
-            company_incharge=self.ceo,
         )
         for u in (self.ceo, self.pm, self.dept_head, self.dev):
             CompanyMembership.objects.create(company=self.company, user=u, status="Active")
