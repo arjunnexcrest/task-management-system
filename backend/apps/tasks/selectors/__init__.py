@@ -48,5 +48,7 @@ def get_task_detail_queryset(request=None):
         "checklists__items__completed_by",
         "comments__author",
         "comments__mentions__mentioned_user",
+        "progress_updates__author",
+        "progress_updates__progress_attachments__attachment__uploaded_by",
         "task_attachments__attachment__uploaded_by",
     )

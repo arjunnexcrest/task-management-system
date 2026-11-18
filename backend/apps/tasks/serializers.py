@@ -692,6 +692,9 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
                 msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
                 raise serializers.ValidationError({"status": msg})
 
+        if task.progress_method in (Task.ProgressMethod.SUBTASKS, Task.ProgressMethod.CHECKLIST):
+            task.recalculate_auto_progress()
+
         from apps.projects.services import recalculate_project_progress_service
 
         recalculate_project_progress_service(project=task.project)
@@ -789,6 +792,7 @@ class TaskDetailSerializer(TaskSerializer):
     dependencies = TaskDependencySerializer(many=True, read_only=True)
     checklists = ChecklistSerializer(many=True, read_only=True)
     comments = serializers.SerializerMethodField()
+    progress_updates = serializers.SerializerMethodField()
     task_attachments = TaskAttachmentSerializer(many=True, read_only=True)
     history_endpoints = serializers.SerializerMethodField()
 
@@ -799,6 +803,7 @@ class TaskDetailSerializer(TaskSerializer):
             "dependencies",
             "checklists",
             "comments",
+            "progress_updates",
             "task_attachments",
             "history_endpoints",
         ]
@@ -807,6 +812,12 @@ class TaskDetailSerializer(TaskSerializer):
         # Return latest 20 comments in detail view; full history is paginated at /api/tasks/{id}/comments/
         recent_comments = obj.comments.all()[:20]
         return TaskCommentSerializer(recent_comments, many=True).data
+
+    def get_progress_updates(self, obj):
+        from apps.tracking.serializers import ProgressUpdateSerializer
+
+        recent_updates = obj.progress_updates.all()[:20]
+        return ProgressUpdateSerializer(recent_updates, many=True).data
 
     def get_history_endpoints(self, obj):
         return {

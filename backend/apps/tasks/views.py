@@ -52,9 +52,14 @@ from .services import (
 )
 
 
-def _default_user(request):
+def _default_user(request, task=None):
     if request and getattr(request, "user", None) and request.user.is_authenticated:
         return request.user
+    if task is not None:
+        if getattr(task, "task_owner", None):
+            return task.task_owner
+        if getattr(task, "created_by", None):
+            return task.created_by
     return User.objects.first()
 
 
@@ -250,7 +255,7 @@ class TaskViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["get", "post"], url_path="progress-updates")
     def progress_updates(self, request, pk=None):
         """
-        Paginated task progress updates history endpoint per DB Design §8.
+        Paginated task progress updates history endpoint per DB Design §8 & SRS §7.5, §9.1.
         """
         from apps.tracking.serializers import ProgressUpdateSerializer
 
@@ -258,15 +263,19 @@ class TaskViewSet(viewsets.ModelViewSet):
         if request.method == "POST":
             data = request.data.copy()
             data["task"] = str(task.id)
-            serializer = ProgressUpdateSerializer(data=data)
+            serializer = ProgressUpdateSerializer(data=data, context={"request": request})
             serializer.is_valid(raise_exception=True)
             if "author" not in serializer.validated_data:
-                serializer.save(author=_default_user(request))
+                serializer.save(author=_default_user(request, task=task))
             else:
                 serializer.save()
             return Response(serializer.data, status=status.HTTP_201_CREATED)
 
-        qs = task.progress_updates.select_related("author").order_by("-created_at")
+        qs = (
+            task.progress_updates.select_related("author", "task", "task__project")
+            .prefetch_related("progress_attachments__attachment__uploaded_by")
+            .order_by("-created_at")
+        )
         page = self.paginate_queryset(qs)
         if page is not None:
             return self.get_paginated_response(ProgressUpdateSerializer(page, many=True).data)
