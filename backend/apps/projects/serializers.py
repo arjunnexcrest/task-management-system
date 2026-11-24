@@ -383,10 +383,21 @@ class MilestoneTaskSerializer(serializers.ModelSerializer):
 
 class MilestoneDependencySerializer(serializers.ModelSerializer):
     depends_on_title = serializers.CharField(source="depends_on_milestone.title", read_only=True)
+    depends_on_status = serializers.CharField(source="depends_on_milestone.status", read_only=True)
+    depends_on_target_date = serializers.DateField(
+        source="depends_on_milestone.target_date", read_only=True
+    )
 
     class Meta:
         model = MilestoneDependency
-        fields = ["id", "milestone", "depends_on_milestone", "depends_on_title"]
+        fields = [
+            "id",
+            "milestone",
+            "depends_on_milestone",
+            "depends_on_title",
+            "depends_on_status",
+            "depends_on_target_date",
+        ]
         read_only_fields = ["id"]
 
     def validate(self, attrs):
@@ -417,6 +428,8 @@ class ProjectMilestoneSerializer(CompanyScopedValidationMixin, serializers.Model
     owner_name = serializers.CharField(source="owner.full_name", read_only=True, default=None)
     milestone_tasks = MilestoneTaskSerializer(many=True, read_only=True)
     dependencies = MilestoneDependencySerializer(many=True, read_only=True)
+    is_overdue = serializers.SerializerMethodField()
+    days_remaining = serializers.SerializerMethodField()
 
     class Meta:
         model = ProjectMilestone
@@ -432,10 +445,26 @@ class ProjectMilestoneSerializer(CompanyScopedValidationMixin, serializers.Model
             "status",
             "approval_required",
             "progress",
+            "is_overdue",
+            "days_remaining",
             "milestone_tasks",
             "dependencies",
         ]
         read_only_fields = ["id"]
+
+    def get_is_overdue(self, obj):
+        from django.utils import timezone
+
+        if obj.target_date and obj.status not in ("Achieved", "Completed"):
+            return obj.target_date < timezone.now().date()
+        return False
+
+    def get_days_remaining(self, obj):
+        from django.utils import timezone
+
+        if not obj.target_date or obj.status in ("Achieved", "Completed"):
+            return None
+        return (obj.target_date - timezone.now().date()).days
 
     def validate(self, attrs):
         project = attrs.get("project") or getattr(self.instance, "project", None)

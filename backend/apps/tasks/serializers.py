@@ -21,12 +21,19 @@ from .models import (
     TaskTagAssignment,
 )
 from .services import (
+    analyze_task_dependency_impact,
+    compute_task_schedule_metrics,
+    evaluate_dependency_edge,
+    evaluate_task_dependencies,
     get_allowed_next_statuses,
+    get_company_working_calendar,
     get_file_category,
+    serialize_working_calendar,
     store_and_create_attachment_service,
     sync_task_associations_service,
     transition_task_status_service,
     validate_attachment_file,
+    validate_task_dependency_service,
 )
 
 ALLOWED_ATTACHMENT_MIME_PREFIXES = (
@@ -111,46 +118,90 @@ class TaskAssignmentSerializer(CompanyScopedValidationMixin, serializers.ModelSe
 
 
 class TaskDependencySerializer(serializers.ModelSerializer):
+    task_title = serializers.CharField(source="task.title", read_only=True)
+    task_status = serializers.CharField(source="task.status", read_only=True)
+    task_start_date = serializers.DateField(source="task.start_date", read_only=True)
+    task_due_date = serializers.DateField(source="task.due_date", read_only=True)
     depends_on_title = serializers.CharField(source="depends_on_task.title", read_only=True)
     depends_on_status = serializers.CharField(source="depends_on_task.status", read_only=True)
+    depends_on_priority = serializers.CharField(source="depends_on_task.priority", read_only=True)
+    depends_on_start_date = serializers.DateField(source="depends_on_task.start_date", read_only=True)
+    depends_on_due_date = serializers.DateField(source="depends_on_task.due_date", read_only=True)
+    depends_on_owner_name = serializers.CharField(
+        source="depends_on_task.task_owner.full_name", read_only=True, default=None
+    )
+    depends_on_is_overdue = serializers.SerializerMethodField()
+    is_satisfied_for_start = serializers.SerializerMethodField()
+    is_satisfied_for_complete = serializers.SerializerMethodField()
+    schedule_conflict = serializers.SerializerMethodField()
 
     class Meta:
         model = TaskDependency
         fields = [
             "id",
             "task",
+            "task_title",
+            "task_status",
+            "task_start_date",
+            "task_due_date",
             "depends_on_task",
             "depends_on_title",
             "depends_on_status",
+            "depends_on_priority",
+            "depends_on_start_date",
+            "depends_on_due_date",
+            "depends_on_owner_name",
+            "depends_on_is_overdue",
             "dependency_type",
+            "is_satisfied_for_start",
+            "is_satisfied_for_complete",
+            "schedule_conflict",
             "created_at",
         ]
         read_only_fields = ["id", "created_at"]
 
+    def _eval(self, obj):
+        cache_attr = "_cached_dep_edge_eval"
+        if not hasattr(obj, cache_attr):
+            setattr(
+                obj,
+                cache_attr,
+                evaluate_dependency_edge(
+                    task=obj.task,
+                    prereq=obj.depends_on_task,
+                    dependency_type=obj.dependency_type,
+                ),
+            )
+        return getattr(obj, cache_attr)
+
+    def get_depends_on_is_overdue(self, obj):
+        return self._eval(obj)["prereq_is_overdue"]
+
+    def get_is_satisfied_for_start(self, obj):
+        return self._eval(obj)["is_satisfied_for_start"]
+
+    def get_is_satisfied_for_complete(self, obj):
+        return self._eval(obj)["is_satisfied_for_complete"]
+
+    def get_schedule_conflict(self, obj):
+        return self._eval(obj)["schedule_conflict"]
+
     def validate(self, attrs):
         task = attrs.get("task") or getattr(self.instance, "task", None)
         depends_on_task = attrs.get("depends_on_task") or getattr(self.instance, "depends_on_task", None)
+        dependency_type = attrs.get("dependency_type") or getattr(
+            self.instance, "dependency_type", TaskDependency.DependencyType.FINISH_TO_START
+        )
         if task and depends_on_task:
-            if task.id == depends_on_task.id:
-                raise serializers.ValidationError("A task cannot depend on itself (DB Design §5).")
-            if task.project_id != depends_on_task.project_id:
-                raise serializers.ValidationError(
-                    "Dependent tasks must belong to the same project (DB Design §4.4 & §5)."
+            try:
+                validate_task_dependency_service(
+                    task=task,
+                    depends_on_task=depends_on_task,
+                    dependency_type=dependency_type,
                 )
-            # Cycle detection across TaskDependency graph
-            visited = {task.id}
-            queue = [depends_on_task.id]
-            while queue:
-                current_id = queue.pop(0)
-                if current_id in visited:
-                    raise serializers.ValidationError(
-                        "Circular task dependency detected; dependency cycles are not allowed (DB Design §5)."
-                    )
-                visited.add(current_id)
-                prereqs = TaskDependency.objects.filter(task_id=current_id).values_list(
-                    "depends_on_task_id", flat=True
-                )
-                queue.extend(prereqs)
+            except DjangoValidationError as exc:
+                msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
+                raise serializers.ValidationError(msg)
         return attrs
 
 
@@ -529,7 +580,16 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
     is_subtask = serializers.BooleanField(read_only=True)
     is_overdue = serializers.SerializerMethodField()
     days_remaining = serializers.SerializerMethodField()
+    days_overdue = serializers.SerializerMethodField()
+    working_days_remaining = serializers.SerializerMethodField()
+    working_days_overdue = serializers.SerializerMethodField()
+    planned_working_days = serializers.SerializerMethodField()
     due_status = serializers.SerializerMethodField()
+    overdue_severity = serializers.SerializerMethodField()
+    is_dependency_blocked = serializers.SerializerMethodField()
+    blocking_prerequisites_count = serializers.SerializerMethodField()
+    downstream_dependents_count = serializers.SerializerMethodField()
+    dependency_warnings_count = serializers.SerializerMethodField()
     allowed_transitions = serializers.SerializerMethodField()
     subtasks_count = serializers.SerializerMethodField()
     actual_effort_hours = serializers.SerializerMethodField()
@@ -606,7 +666,16 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
             "approval_required",
             "is_overdue",
             "days_remaining",
+            "days_overdue",
+            "working_days_remaining",
+            "working_days_overdue",
+            "planned_working_days",
             "due_status",
+            "overdue_severity",
+            "is_dependency_blocked",
+            "blocking_prerequisites_count",
+            "downstream_dependents_count",
+            "dependency_warnings_count",
             "allowed_transitions",
             "subtasks_count",
             "active_assignments",
@@ -849,29 +918,72 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
         ]
         return data
 
+    def _get_schedule_metrics(self, obj):
+        cache_attr = "_cached_schedule_metrics"
+        if not hasattr(obj, cache_attr):
+            cal_cache = self.context.setdefault("_company_calendar_cache", {})
+            company = getattr(getattr(obj, "project", None), "company", None)
+            comp_id = getattr(company, "id", None)
+            if comp_id not in cal_cache:
+                cal_cache[comp_id] = get_company_working_calendar(company)
+            setattr(
+                obj,
+                cache_attr,
+                compute_task_schedule_metrics(obj, calendar_cfg=cal_cache[comp_id]),
+            )
+        return getattr(obj, cache_attr)
+
+    def _get_dep_eval(self, obj):
+        cache_attr = "_cached_dep_eval"
+        if not hasattr(obj, cache_attr):
+            setattr(obj, cache_attr, evaluate_task_dependencies(obj))
+        return getattr(obj, cache_attr)
+
     def get_is_overdue(self, obj):
-        if obj.due_date and obj.status not in [Task.Status.COMPLETED, Task.Status.CANCELLED]:
-            return obj.due_date < timezone.now().date()
-        return False
+        return self._get_schedule_metrics(obj)["is_overdue"]
 
     def get_days_remaining(self, obj):
-        if not obj.due_date or obj.status in [Task.Status.COMPLETED, Task.Status.CANCELLED]:
-            return None
-        return (obj.due_date - timezone.now().date()).days
+        return self._get_schedule_metrics(obj)["days_remaining"]
+
+    def get_days_overdue(self, obj):
+        return self._get_schedule_metrics(obj)["days_overdue"]
+
+    def get_working_days_remaining(self, obj):
+        return self._get_schedule_metrics(obj)["working_days_remaining"]
+
+    def get_working_days_overdue(self, obj):
+        return self._get_schedule_metrics(obj)["working_days_overdue"]
+
+    def get_planned_working_days(self, obj):
+        return self._get_schedule_metrics(obj)["planned_working_days"]
 
     def get_due_status(self, obj):
-        if obj.status in [Task.Status.COMPLETED, Task.Status.CANCELLED]:
-            return "Completed"
-        if not obj.due_date:
-            return "No Due Date"
-        diff = (obj.due_date - timezone.now().date()).days
-        if diff < 0:
-            return "Overdue"
-        if diff == 0:
-            return "Due Today"
-        if diff <= 3:
-            return "Due Soon"
-        return "On Track"
+        return self._get_schedule_metrics(obj)["due_status"]
+
+    def get_overdue_severity(self, obj):
+        return self._get_schedule_metrics(obj)["overdue_severity"]
+
+    def get_is_dependency_blocked(self, obj):
+        return self._get_dep_eval(obj)["is_dependency_blocked"]
+
+    def get_blocking_prerequisites_count(self, obj):
+        return self._get_dep_eval(obj)["blocking_prerequisites_count"]
+
+    def get_downstream_dependents_count(self, obj):
+        return len(list(obj.dependent_tasks.all()))
+
+    def get_dependency_warnings_count(self, obj):
+        dep_eval = self._get_dep_eval(obj)
+        count = len(dep_eval["schedule_conflicts"]) + len(dep_eval["at_risk_prerequisites"])
+        metrics = self._get_schedule_metrics(obj)
+        if metrics["is_overdue"] or obj.status in (Task.Status.BLOCKED, Task.Status.ON_HOLD):
+            open_down = sum(
+                1
+                for d in obj.dependent_tasks.all()
+                if d.task.status not in (Task.Status.COMPLETED, Task.Status.CANCELLED)
+            )
+            count += open_down
+        return count
 
     def get_allowed_transitions(self, obj):
         return get_allowed_next_statuses(task=obj)
@@ -921,6 +1033,9 @@ class TaskDetailSerializer(TaskSerializer):
     subtasks = SubtaskNestedSerializer(many=True, read_only=True)
     assignments = TaskAssignmentSerializer(many=True, read_only=True)
     dependencies = TaskDependencySerializer(many=True, read_only=True)
+    dependent_tasks = TaskDependencySerializer(many=True, read_only=True)
+    dependency_summary = serializers.SerializerMethodField()
+    working_calendar = serializers.SerializerMethodField()
     checklists = ChecklistSerializer(many=True, read_only=True)
     comments = serializers.SerializerMethodField()
     progress_updates = serializers.SerializerMethodField()
@@ -935,6 +1050,9 @@ class TaskDetailSerializer(TaskSerializer):
             "subtasks",
             "assignments",
             "dependencies",
+            "dependent_tasks",
+            "dependency_summary",
+            "working_calendar",
             "checklists",
             "comments",
             "progress_updates",
@@ -944,6 +1062,22 @@ class TaskDetailSerializer(TaskSerializer):
             "task_attachments",
             "history_endpoints",
         ]
+
+    def get_dependency_summary(self, obj):
+        cal_cache = self.context.setdefault("_company_calendar_cache", {})
+        company = getattr(getattr(obj, "project", None), "company", None)
+        comp_id = getattr(company, "id", None)
+        if comp_id not in cal_cache:
+            cal_cache[comp_id] = get_company_working_calendar(company)
+        return analyze_task_dependency_impact(obj, calendar_cfg=cal_cache[comp_id])
+
+    def get_working_calendar(self, obj):
+        cal_cache = self.context.setdefault("_company_calendar_cache", {})
+        company = getattr(getattr(obj, "project", None), "company", None)
+        comp_id = getattr(company, "id", None)
+        if comp_id not in cal_cache:
+            cal_cache[comp_id] = get_company_working_calendar(company)
+        return serialize_working_calendar(cal_cache[comp_id])
 
     def get_comments(self, obj):
         # Return latest 20 comments in detail view; full history is paginated at /api/tasks/{id}/comments/
@@ -983,4 +1117,5 @@ class TaskDetailSerializer(TaskSerializer):
             "reviews": f"/api/tasks/{obj.id}/reviews/",
             "review_chain": f"/api/tasks/{obj.id}/review-chain/",
             "time_entries": f"/api/tasks/{obj.id}/time-entries/",
+            "dependency_impact": f"/api/tasks/{obj.id}/dependency-impact/",
         }

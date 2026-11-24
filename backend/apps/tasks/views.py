@@ -47,16 +47,23 @@ from .serializers import (
     TaskTagSerializer,
 )
 from .services import (
+    analyze_task_dependency_impact,
     assign_task_service,
+    build_project_dependency_graph_service,
     bulk_assign_tasks_service,
+    check_and_notify_deadlines_service,
     check_attachment_access_permission,
+    compute_overdue_summary_service,
     delete_attachment_service,
     delete_task_service,
     get_allowed_next_statuses,
+    get_company_working_calendar,
     remove_physical_file_if_unreferenced,
     reschedule_task_service,
+    serialize_working_calendar,
     store_and_create_attachment_service,
     transition_task_status_service,
+    update_company_working_calendar_service,
 )
 
 
@@ -203,9 +210,10 @@ class TaskViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path="transition-status")
     def transition_status(self, request, pk=None):
         """
-        SRS §7.3, §8.3, §14.3 & §22:
+        SRS §7.3, §7.9, §8.3, §14.3 & §22:
         Atomically transitions task status while validating permitted workflow paths,
-        responsible owner, required approvals, and subtask completion / authorized overrides.
+        responsible owner, prerequisite dependencies (FS/SS/FF/SF), required approvals,
+        and subtask completion / authorized overrides.
         """
         task = self.get_object()
         new_status = request.data.get("status")
@@ -216,6 +224,7 @@ class TaskViewSet(viewsets.ModelViewSet):
                 actor=_default_user(request),
                 reason=request.data.get("reason"),
                 override_subtasks=bool(request.data.get("override_subtasks", False)),
+                override_dependencies=bool(request.data.get("override_dependencies", False)),
                 override_reason=request.data.get("override_reason"),
             )
         except DjangoValidationError as exc:
@@ -223,6 +232,116 @@ class TaskViewSet(viewsets.ModelViewSet):
             return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
         refreshed = get_task_detail_queryset(request).get(pk=updated.pk)
         return Response(TaskDetailSerializer(refreshed).data)
+
+    @action(detail=True, methods=["get"], url_path="dependency-impact")
+    def dependency_impact(self, request, pk=None):
+        """
+        SRS §7.9 & §12.4:
+        Returns upstream prerequisite status, schedule conflicts, transitive downstream
+        dependent tasks, and manager delay ripple warnings for this task.
+        """
+        task = self.get_object()
+        return Response(analyze_task_dependency_impact(task))
+
+    @action(detail=False, methods=["get"], url_path="dependency-graph")
+    def dependency_graph(self, request):
+        """
+        SRS §7.9 & §12.4:
+        Returns project-scoped task dependency DAG (nodes with topological levels & overdue
+        metrics, edges with satisfaction & schedule conflict flags, and delay warnings).
+        """
+        project_id = request.query_params.get("project")
+        if not project_id:
+            return Response(
+                {"error": "Query parameter 'project' (Project UUID) is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        scoped_qs = self.filter_queryset(self.get_queryset())
+        return Response(
+            build_project_dependency_graph_service(
+                project_id=project_id,
+                tasks_queryset=scoped_qs,
+            )
+        )
+
+    @action(detail=False, methods=["get"], url_path="overdue-summary")
+    def overdue_summary(self, request):
+        """
+        SRS §7.10, §10.5, §20.1 & §27.3:
+        Returns company/project/team/assignee scoped overdue, due-today, due-soon, and
+        dependency-blocked KPIs + categorized task lists respecting company working calendars.
+        """
+        qs = self.filter_queryset(self.get_queryset())
+        return Response(compute_overdue_summary_service(tasks_queryset=qs))
+
+    @action(detail=False, methods=["post"], url_path="check-deadlines")
+    def check_deadlines(self, request):
+        """
+        SRS §7.10, §13.1, §20.2 & §22 (#10, #17):
+        Scans open tasks in the authorized scope for overdue tasks, upcoming deadlines,
+        and downstream dependency delay risks, dispatching deduplicated notifications.
+        """
+        qs = self.filter_queryset(self.get_queryset())
+        project_id = request.data.get("project") or request.query_params.get("project")
+        company_id = request.data.get("company") or request.query_params.get("company")
+        if project_id:
+            qs = qs.filter(project_id=project_id)
+        if company_id:
+            qs = qs.filter(project__company_id=company_id)
+        raw_dedupe = request.data.get("dedupe_hours", 24)
+        try:
+            dedupe_hours = max(0, int(raw_dedupe))
+        except (TypeError, ValueError):
+            dedupe_hours = 24
+        return Response(
+            check_and_notify_deadlines_service(
+                tasks_queryset=qs,
+                dedupe_hours=dedupe_hours,
+            )
+        )
+
+    @action(detail=False, methods=["get", "post"], url_path="working-calendar")
+    def working_calendar(self, request):
+        """
+        SRS §20.1 & §20.2:
+        GET: Returns effective company working days, holidays, hours/day, and deadline reminder thresholds.
+        POST: Updates the company's working_calendar JSONB & reminder settings.
+        """
+        from apps.companies.models import Company
+
+        company_id = (
+            request.query_params.get("company")
+            or request.data.get("company")
+            or request.headers.get("X-Company-ID")
+        )
+        company = (
+            Company.objects.filter(id=company_id).first()
+            if company_id
+            else Company.objects.filter(status=Company.Status.ACTIVE).order_by("name").first()
+        )
+        if company is None:
+            return Response(
+                {"error": "No active company found for working calendar configuration."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if request.method == "POST":
+            try:
+                updated = update_company_working_calendar_service(
+                    company=company,
+                    working_days=request.data.get("working_days"),
+                    holidays=request.data.get("holidays"),
+                    hours_per_day=request.data.get("hours_per_day"),
+                    due_soon_days=request.data.get("due_soon_days"),
+                    deadline_reminder_days=request.data.get("deadline_reminder_days"),
+                    actor=_default_user(request),
+                )
+            except DjangoValidationError as exc:
+                msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
+                return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(updated)
+
+        return Response(serialize_working_calendar(get_company_working_calendar(company)))
 
     @action(detail=True, methods=["get"])
     def subtasks(self, request, pk=None):
@@ -614,7 +733,13 @@ class TaskDependencyViewSet(viewsets.ModelViewSet):
     filterset_fields = ["task", "depends_on_task", "dependency_type"]
 
     def get_queryset(self):
-        qs = TaskDependency.objects.select_related("task", "task__project", "depends_on_task").all()
+        qs = TaskDependency.objects.select_related(
+            "task",
+            "task__project",
+            "task__task_owner",
+            "depends_on_task",
+            "depends_on_task__task_owner",
+        ).all()
         return scope_queryset_by_company(qs, self.request, company_lookup="task__project__company_id")
 
 

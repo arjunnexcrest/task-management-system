@@ -420,6 +420,17 @@ def reschedule_task_service(
                     related_task=task,
                 )
 
+        # SRS §7.9: Warn managers & downstream owners when a deadline slip impacts dependent work
+        if "due_date" in update_fields and parsed_due is not None and (
+            old_due is None or parsed_due > old_due
+        ):
+            notify_dependency_delay_impact(
+                task=task,
+                trigger_reason=f"Deadline shifted ({old_due or 'TBD'} → {parsed_due})",
+                actor=actor,
+                dedupe_hours=0,
+            )
+
     return task
 
 
@@ -726,16 +737,18 @@ def transition_task_status_service(
     actor=None,
     reason: str | None = None,
     override_subtasks: bool = False,
+    override_dependencies: bool = False,
     override_reason: str | None = None,
 ) -> Task:
     """
-    SRS §7.3, §8.3, §12.2, §14.3 & §22 Core Business Rules #3, #5, #7, #9:
+    SRS §7.3, §7.9, §8.3, §12.2, §14.3 & §22 Core Business Rules #3, #5, #7, #9, #20:
     Atomically transitions a task's workflow status while validating:
     1. Permitted transition path (configured WorkflowTransition or SRS §7.3 defaults)
     2. Responsible owner / active assignee before active execution
-    3. Required review/approval before Completed
-    4. Mandatory subtask completion before parent completion (unless authorized override with reason)
-    5. Traceable status-change comment, notifications, and progress recalculation
+    3. Prerequisite task dependencies (FS, SS, FF, SF) unless authorized override with reason
+    4. Required review/approval before Completed
+    5. Mandatory subtask completion before parent completion (unless authorized override with reason)
+    6. Traceable status-change comment, delay impact warnings, notifications, and progress recalculation
     """
     valid_statuses = {choice[0] for choice in Task.Status.choices}
     if new_status not in valid_statuses:
@@ -772,6 +785,14 @@ def transition_task_status_service(
             raise ValidationError(
                 f"Task must have a responsible Task Owner or active assignee before moving to '{new_status}' (SRS §22 #3)."
             )
+
+    # 2b. Enforce prerequisite task dependencies across FS/SS/FF/SF (SRS §7.9 & §22 #20)
+    check_dependency_rules_for_transition(
+        task=task,
+        new_status=new_status,
+        override_dependencies=override_dependencies,
+        override_reason=override_reason,
+    )
 
     # 3. Enforce approval & subtask completion rules when completing (SRS §8.3, §14.3, §22 #7, #9)
     if new_status == Task.Status.COMPLETED:
@@ -822,11 +843,22 @@ def transition_task_status_service(
         note_parts.append(f"Reason: {reason.strip()}")
     if override_subtasks and override_reason and override_reason.strip():
         note_parts.append(f"Subtask Override: {override_reason.strip()}")
+    if override_dependencies and override_reason and override_reason.strip():
+        note_parts.append(f"Dependency Override: {override_reason.strip()}")
     TaskComment.objects.create(
         task=task,
         author_id=author_id,
         content=" | ".join(note_parts),
     )
+
+    # SRS §7.9: Warn managers & downstream owners if prerequisite becomes Blocked or On Hold
+    if new_status in (Task.Status.BLOCKED, Task.Status.ON_HOLD):
+        notify_dependency_delay_impact(
+            task=task,
+            trigger_reason=f"Prerequisite moved to {new_status}",
+            actor=actor,
+            dedupe_hours=0,
+        )
 
     # 5. Relevant notifications (SRS §13.1 & §22 #17)
     if new_status == Task.Status.IN_REVIEW and task.reviewer_id:
@@ -873,4 +905,22 @@ from .attachments import (  # noqa: E402,F401
     remove_physical_file_if_unreferenced,
     store_and_create_attachment_service,
     validate_attachment_file,
+)
+from .dependencies import (  # noqa: E402,F401
+    analyze_task_dependency_impact,
+    build_project_dependency_graph_service,
+    check_and_notify_deadlines_service,
+    check_dependency_rules_for_transition,
+    compute_overdue_summary_service,
+    compute_task_schedule_metrics,
+    count_inclusive_working_days,
+    count_working_days_between,
+    evaluate_dependency_edge,
+    evaluate_task_dependencies,
+    get_company_working_calendar,
+    is_working_day,
+    notify_dependency_delay_impact,
+    serialize_working_calendar,
+    update_company_working_calendar_service,
+    validate_task_dependency_service,
 )
