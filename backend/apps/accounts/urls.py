@@ -16,6 +16,9 @@ from .views import (
 router = DefaultRouter()
 router.register(r"users", UserViewSet, basename="user")
 
+user_only_router = DefaultRouter()
+user_only_router.register(r"", UserViewSet, basename="users")
+
 urlpatterns = [
     path("login/", LoginView.as_view(), name="auth-login"),
     path("refresh/", RefreshView.as_view(), name="auth-refresh"),

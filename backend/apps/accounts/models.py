@@ -3,6 +3,8 @@ from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, Permis
 from django.db import models
 from django.utils import timezone
 
+from apps.rbac.roles import SystemRole
+
 
 class UserQuerySet(models.QuerySet):
     def delete(self):
@@ -62,6 +64,8 @@ class User(AbstractBaseUser, PermissionsMixin):
         PENDING_ACTIVATION = "PendingActivation", "Pending Activation"
         SUSPENDED = "Suspended", "Suspended"
         DEACTIVATED = "Deactivated", "Deactivated"
+
+    RoleChoices = SystemRole
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     employee_id = models.CharField(max_length=50, blank=True, null=True, default="")
