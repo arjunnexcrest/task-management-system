@@ -87,6 +87,18 @@ class TaskReviewViewSet(viewsets.ModelViewSet):
                     )
             serializer.save()
 
+    def update(self, request, *args, **kwargs):
+        raise MethodNotAllowed(
+            "PUT",
+            detail="Historical task review records are immutable and cannot be modified for audit integrity (DB Design §5 & SRS §14.3).",
+        )
+
+    def partial_update(self, request, *args, **kwargs):
+        raise MethodNotAllowed(
+            "PATCH",
+            detail="Historical task review records are immutable and cannot be modified for audit integrity (DB Design §5 & SRS §14.3).",
+        )
+
     def destroy(self, request, *args, **kwargs):
         raise MethodNotAllowed(
             "DELETE",

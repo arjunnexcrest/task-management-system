@@ -884,6 +884,13 @@ def transition_task_status_service(
         ).count()
         if incomplete_subtasks > 0:
             if override_subtasks:
+                if is_auth_actor:
+                    from apps.common.permissions import ROLE_DELIVERY_LEADS, user_has_any_role
+
+                    if not user_has_any_role(actor, ROLE_DELIVERY_LEADS):
+                        raise PermissionDenied(
+                            "Only Team Leaders, Department Heads, Project Managers, or Executives may override incomplete subtasks (SRS §8.3 & §22 #9)."
+                        )
                 if not (override_reason and override_reason.strip()):
                     raise ValidationError(
                         "An authorized override reason is required to complete a task with open subtasks (SRS §8.3 & §22 #9)."

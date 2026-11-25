@@ -410,6 +410,8 @@ class ReviewManagementPermission(RoleScopedCompanyPermission):
     write_roles = ROLE_DELIVERY_LEADS
     delete_roles = ROLE_DELIVERY_LEADS | {"Employee"}
     action_roles = {
+        "update": ROLE_DELIVERY_LEADS | {"Employee"},
+        "partial_update": ROLE_DELIVERY_LEADS | {"Employee"},
         "submit": ROLE_DELIVERY_LEADS | {"Employee"},
         "submit_decision": ROLE_DELIVERY_LEADS,
         "reassign_reviewer": ROLE_DELIVERY_LEADS,

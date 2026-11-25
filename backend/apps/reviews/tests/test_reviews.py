@@ -1,5 +1,8 @@
+import shutil
+import tempfile
 from datetime import timedelta
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import override_settings
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
@@ -18,6 +21,19 @@ class ReviewApprovalWorkflowTestCase(APITestCase):
     Task #14: Implement review, approval and correction workflow (Approval flow working).
     Validates SRS §7.3, §13.1, §14.1–§14.4, §20.2, §22 (#5, #7, #17, #20), §27.3 & DB Design §4.6, §5, §8.
     """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._temp_media_dir = tempfile.mkdtemp(prefix="tms_test_reviews_")
+        cls._media_override = override_settings(MEDIA_ROOT=cls._temp_media_dir)
+        cls._media_override.enable()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._media_override.disable()
+        shutil.rmtree(cls._temp_media_dir, ignore_errors=True)
+        super().tearDownClass()
 
     def setUp(self):
         self.pm = User.objects.create_user(

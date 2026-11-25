@@ -1,7 +1,10 @@
 import hashlib
+import shutil
+import tempfile
 from pathlib import Path
 from django.conf import settings
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import override_settings
 from rest_framework import status
 from rest_framework.test import APITestCase
 
@@ -18,6 +21,19 @@ class AttachmentsAndFileUploadHandlingTestCase(APITestCase):
     Task #13: Implement attachments and file upload handling (Document storage, validation, download & delete).
     Validates SRS §7.7, §7.8, §20.1, §24.2, §27.3, §27.5 & DB Design §4.5, §5, §6, §7 Rule #9.
     """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._temp_media_dir = tempfile.mkdtemp(prefix="tms_test_attachments_")
+        cls._media_override = override_settings(MEDIA_ROOT=cls._temp_media_dir)
+        cls._media_override.enable()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._media_override.disable()
+        shutil.rmtree(cls._temp_media_dir, ignore_errors=True)
+        super().tearDownClass()
 
     def setUp(self):
         self.pm = User.objects.create_user(
