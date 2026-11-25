@@ -4,6 +4,7 @@ from rest_framework.renderers import BaseRenderer, BrowsableAPIRenderer, JSONRen
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from apps.common.permissions import ReportAccessPermission
+from apps.tasks.filters import TaskFilterSet
 from apps.tasks.selectors import get_task_list_queryset
 from apps.tasks.services import (
     compute_task_schedule_metrics,
@@ -30,7 +31,17 @@ class TaskExportReportView(APIView):
     renderer_classes = [JSONRenderer, BrowsableAPIRenderer, PassThroughCSVRenderer]
 
     def get(self, request):
-        tasks_qs = get_task_list_queryset(request).order_by("-created_at")
+        base_qs = get_task_list_queryset(request).order_by("-created_at")
+        tasks_qs = TaskFilterSet(request.query_params, queryset=base_qs, request=request).qs
+        search_q = (request.query_params.get("search") or "").strip()
+        if search_q:
+            from django.db.models import Q
+
+            tasks_qs = tasks_qs.filter(
+                Q(title__icontains=search_q)
+                | Q(project__code__icontains=search_q)
+                | Q(project__name__icontains=search_q)
+            )
         export_format = (
             request.query_params.get("export")
             or request.query_params.get("format")
