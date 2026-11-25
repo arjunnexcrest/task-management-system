@@ -8,7 +8,7 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 
 from apps.accounts.models import User
-from apps.common.permissions import IsCompanyMemberOrAllowAnyInDev
+from apps.common.permissions import ReviewManagementPermission
 from apps.companies.models import Company
 from apps.projects.models import Project
 from apps.tasks.models import Task
@@ -52,7 +52,7 @@ class TaskReviewViewSet(viewsets.ModelViewSet):
     """
 
     serializer_class = TaskReviewSerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [ReviewManagementPermission]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_class = TaskReviewFilterSet

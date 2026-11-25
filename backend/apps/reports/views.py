@@ -3,7 +3,7 @@ from django.http import HttpResponse
 from rest_framework.renderers import BaseRenderer, BrowsableAPIRenderer, JSONRenderer
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from apps.common.permissions import IsCompanyMemberOrAllowAnyInDev
+from apps.common.permissions import ReportAccessPermission
 from apps.tasks.selectors import get_task_list_queryset
 from apps.tasks.services import (
     compute_task_schedule_metrics,
@@ -26,7 +26,7 @@ class TaskExportReportView(APIView):
     Includes overdue calculation (calendar & working days) and dependency-blocked status.
     """
 
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [ReportAccessPermission]
     renderer_classes = [JSONRenderer, BrowsableAPIRenderer, PassThroughCSVRenderer]
 
     def get(self, request):

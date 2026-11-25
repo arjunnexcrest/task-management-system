@@ -13,7 +13,12 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 
 from apps.accounts.models import User
-from apps.common.permissions import IsCompanyMemberOrAllowAnyInDev
+from apps.common.permissions import (
+    IsCompanyMemberOrAllowAnyInDev,
+    TaskAssignmentPermission,
+    TaskDependencyPermission,
+    TaskManagementPermission,
+)
 from apps.common.selectors import scope_queryset_by_company
 from .filters import TaskAssignmentFilterSet, TaskFilterSet
 from .models import (
@@ -80,7 +85,7 @@ def _default_user(request, task=None):
 
 
 class TaskViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [TaskManagementPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_class = TaskFilterSet
     search_fields = ["title", "description", "project__name", "project__code"]
@@ -703,7 +708,7 @@ class TaskViewSet(viewsets.ModelViewSet):
 
 class TaskAssignmentViewSet(viewsets.ModelViewSet):
     serializer_class = TaskAssignmentSerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [TaskAssignmentPermission]
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_class = TaskAssignmentFilterSet
     ordering_fields = ["assigned_at", "ended_at"]
@@ -735,7 +740,7 @@ class TaskAssignmentViewSet(viewsets.ModelViewSet):
 
 class TaskDependencyViewSet(viewsets.ModelViewSet):
     serializer_class = TaskDependencySerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [TaskDependencyPermission]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ["task", "depends_on_task", "dependency_type"]
 

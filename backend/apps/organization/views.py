@@ -4,7 +4,13 @@ from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from apps.common.permissions import IsCompanyMemberOrAllowAnyInDev
+from apps.common.permissions import (
+    DepartmentManagementPermission,
+    DepartmentMembershipPermission,
+    TeamManagementPermission,
+    TeamMembershipPermission,
+    UserManagementPermission,
+)
 from apps.common.selectors import scope_queryset_by_company
 from .models import (
     Department,
@@ -24,7 +30,7 @@ from .serializers import (
 
 class DepartmentViewSet(viewsets.ModelViewSet):
     serializer_class = DepartmentSerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [DepartmentManagementPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ["company", "status"]
     search_fields = ["name", "code"]
@@ -93,7 +99,7 @@ class DepartmentViewSet(viewsets.ModelViewSet):
 
 class DepartmentMembershipViewSet(viewsets.ModelViewSet):
     serializer_class = DepartmentMembershipSerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [DepartmentMembershipPermission]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ["department", "user", "is_head", "status"]
 
@@ -104,7 +110,7 @@ class DepartmentMembershipViewSet(viewsets.ModelViewSet):
 
 class TeamViewSet(viewsets.ModelViewSet):
     serializer_class = TeamSerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [TeamManagementPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ["department", "status"]
     search_fields = ["name", "code"]
@@ -137,7 +143,7 @@ class TeamViewSet(viewsets.ModelViewSet):
 
 class TeamMembershipViewSet(viewsets.ModelViewSet):
     serializer_class = TeamMembershipSerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [TeamMembershipPermission]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ["team", "user", "is_leader", "status"]
 
@@ -148,7 +154,7 @@ class TeamMembershipViewSet(viewsets.ModelViewSet):
 
 class ReportingRelationshipViewSet(viewsets.ModelViewSet):
     serializer_class = ReportingRelationshipSerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [UserManagementPermission]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ["company", "employee", "manager"]
 

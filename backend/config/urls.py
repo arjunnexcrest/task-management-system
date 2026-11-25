@@ -61,6 +61,8 @@ def api_root(request):
                 "reviews": "/api/reviews/",
                 "notifications": "/api/notifications/",
                 "dashboards_summary": "/api/dashboards/summary/",
+                "dashboards_ceo": "/api/dashboards/ceo/",
+                "dashboards_role": "/api/dashboards/role/",
                 "reports_tasks": "/api/reports/tasks/",
                 "risks_blockers": "/api/risks/blockers/",
                 "risks_register": "/api/risks/risks/",

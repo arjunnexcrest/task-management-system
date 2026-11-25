@@ -1,7 +1,7 @@
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters, viewsets
 from apps.accounts.models import User
-from apps.common.permissions import IsCompanyMemberOrAllowAnyInDev
+from apps.common.permissions import IsCompanyMemberOrAllowAnyInDev, RiskManagementPermission
 from apps.common.selectors import scope_queryset_by_company
 from .models import Blocker, Issue, Risk
 from .serializers import BlockerSerializer, IssueSerializer, RiskSerializer
@@ -35,7 +35,7 @@ class BlockerViewSet(viewsets.ModelViewSet):
 
 class RiskViewSet(viewsets.ModelViewSet):
     serializer_class = RiskSerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [RiskManagementPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ["project", "status", "severity", "probability", "impact", "owner"]
     search_fields = ["title", "description"]
@@ -48,7 +48,7 @@ class RiskViewSet(viewsets.ModelViewSet):
 
 class IssueViewSet(viewsets.ModelViewSet):
     serializer_class = IssueSerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [RiskManagementPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ["project", "task", "status", "priority", "owner"]
     search_fields = ["title", "description"]

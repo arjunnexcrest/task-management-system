@@ -189,12 +189,14 @@ class ProgressUpdatesAndRemarksTestCase(APITestCase):
         ChecklistItem.objects.create(checklist=cl, title="Step 3", is_completed=False)
         ChecklistItem.objects.create(checklist=cl, title="Step 4", is_completed=False)
 
+        self.client.force_authenticate(user=self.pm)
         patch_res = self.client.patch(
             f"/api/tasks/{manual_parent.id}/",
             {"progress_method": "Checklist"},
             format="json",
         )
         self.assertEqual(patch_res.status_code, 200)
+        self.client.force_authenticate(user=self.dev)
         manual_parent.refresh_from_db()
         self.assertEqual(manual_parent.progress, Decimal("50.00"))
 

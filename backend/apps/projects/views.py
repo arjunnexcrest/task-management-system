@@ -4,7 +4,11 @@ from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
-from apps.common.permissions import IsCompanyMemberOrAllowAnyInDev
+from apps.common.permissions import (
+    ProjectManagementPermission,
+    ProjectParticipationWritePermission,
+    ProjectPlanningWritePermission,
+)
 from apps.common.selectors import scope_queryset_by_company
 from .filters import ProjectFilterSet, ProjectMilestoneFilterSet, ProjectPhaseFilterSet
 from .models import (
@@ -46,7 +50,7 @@ from .services import (
 
 
 class ProjectViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [ProjectManagementPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_class = ProjectFilterSet
     search_fields = ["name", "code", "description", "objectives", "deliverables"]
@@ -290,7 +294,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
 class ProjectMemberViewSet(viewsets.ModelViewSet):
     serializer_class = ProjectMemberSerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [ProjectParticipationWritePermission]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ["project", "user", "status"]
 
@@ -351,7 +355,7 @@ class ProjectMemberViewSet(viewsets.ModelViewSet):
 
 class ProjectDepartmentViewSet(viewsets.ModelViewSet):
     serializer_class = ProjectDepartmentSerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [ProjectParticipationWritePermission]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ["project", "department"]
 
@@ -362,7 +366,7 @@ class ProjectDepartmentViewSet(viewsets.ModelViewSet):
 
 class ProjectTeamViewSet(viewsets.ModelViewSet):
     serializer_class = ProjectTeamSerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [ProjectParticipationWritePermission]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ["project", "team"]
 
@@ -373,7 +377,7 @@ class ProjectTeamViewSet(viewsets.ModelViewSet):
 
 class ProjectPhaseViewSet(viewsets.ModelViewSet):
     serializer_class = ProjectPhaseSerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [ProjectPlanningWritePermission]
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_class = ProjectPhaseFilterSet
     ordering_fields = ["start_date", "end_date", "progress", "name"]
@@ -385,7 +389,7 @@ class ProjectPhaseViewSet(viewsets.ModelViewSet):
 
 class ProjectMilestoneViewSet(viewsets.ModelViewSet):
     serializer_class = ProjectMilestoneSerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [ProjectPlanningWritePermission]
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_class = ProjectMilestoneFilterSet
     ordering_fields = ["target_date", "progress", "title"]
@@ -401,7 +405,7 @@ class ProjectMilestoneViewSet(viewsets.ModelViewSet):
 
 class MilestoneTaskViewSet(viewsets.ModelViewSet):
     serializer_class = MilestoneTaskSerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [ProjectPlanningWritePermission]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ["milestone", "task"]
 
@@ -412,7 +416,7 @@ class MilestoneTaskViewSet(viewsets.ModelViewSet):
 
 class MilestoneDependencyViewSet(viewsets.ModelViewSet):
     serializer_class = MilestoneDependencySerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [ProjectPlanningWritePermission]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ["milestone", "depends_on_milestone"]
 

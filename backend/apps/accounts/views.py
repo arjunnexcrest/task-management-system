@@ -7,7 +7,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from apps.common.permissions import IsCompanyMemberOrAllowAnyInDev
+from apps.common.permissions import UserManagementPermission
 from .models import User
 from .serializers import (
     ChangePasswordSerializer,
@@ -122,7 +122,7 @@ class ChangePasswordView(APIView):
 class UserViewSet(viewsets.ModelViewSet):
     queryset = User.objects.all()
     serializer_class = UserSerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [UserManagementPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ["account_status", "is_active", "is_staff"]
     search_fields = ["full_name", "email", "username", "employee_id", "designation"]

@@ -47,8 +47,22 @@ class M2ProjectTaskEndToEndIntegrationTestCase(APITestCase):
             name="M2 Enterprise Corp",
             code="M2-CORP",
         )
+        from apps.rbac.models import MembershipRole, Role
+
+        pm_role, _ = Role.objects.get_or_create(
+            code="ProjectManager", defaults={"name": "Project Manager", "is_system_role": True}
+        )
+        ceo_role, _ = Role.objects.get_or_create(
+            code="CEO", defaults={"name": "CEO", "is_system_role": True}
+        )
+        self.ceo.is_superuser = True
+        self.ceo.save(update_fields=["is_superuser"])
         for u in (self.ceo, self.pm, self.dept_head, self.dev):
-            CompanyMembership.objects.create(company=self.company, user=u, status="Active")
+            cm = CompanyMembership.objects.create(company=self.company, user=u, status="Active")
+            if u == self.ceo:
+                MembershipRole.objects.create(membership=cm, role=ceo_role)
+            elif u == self.pm:
+                MembershipRole.objects.create(membership=cm, role=pm_role)
 
         self.dept = Department.objects.create(
             company=self.company,
@@ -90,6 +104,7 @@ class M2ProjectTaskEndToEndIntegrationTestCase(APITestCase):
         self.assertEqual(proj_res.status_code, status.HTTP_201_CREATED, proj_res.content)
         project_id = proj_res.data["id"]
 
+        self.client.force_authenticate(user=self.ceo)
         pm_res = self.client.post(
             f"/api/projects/{project_id}/assign_manager/",
             {"project_manager": str(self.pm.id), "auto_activate": True},
@@ -97,6 +112,7 @@ class M2ProjectTaskEndToEndIntegrationTestCase(APITestCase):
         )
         self.assertEqual(pm_res.status_code, 200)
         self.assertEqual(pm_res.data["status"], "Active")
+        self.client.force_authenticate(user=self.pm)
 
         dept_res = self.client.post(
             f"/api/projects/{project_id}/map_departments/",
