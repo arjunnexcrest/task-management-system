@@ -6,6 +6,13 @@ from drf_spectacular.views import (
     SpectacularRedocView,
     SpectacularSwaggerView,
 )
+from rest_framework.routers import DefaultRouter
+from rest_framework_simplejwt.views import TokenRefreshView
+
+from apps.accounts.views import UserViewSet
+
+users_alias_router = DefaultRouter()
+users_alias_router.register(r"users", UserViewSet, basename="users-alias")
 
 
 def api_root(request):
@@ -19,6 +26,10 @@ def api_root(request):
                 "swagger_docs": "/api/docs/",
                 "redoc": "/api/redoc/",
                 "lookup": "/api/lookup/",
+                "auth_login": "/api/accounts/login/",
+                "auth_me": "/api/accounts/me/",
+                "auth_logout": "/api/accounts/logout/",
+                "auth_refresh": "/api/auth/refresh/",
                 "accounts": "/api/accounts/users/",
                 "companies": "/api/companies/",
                 "company_memberships": "/api/companies/memberships/",
@@ -189,6 +200,8 @@ urlpatterns = [
         name="redoc",
     ),
     # All 13 SRS & Database Design Module APIs Wired
+    path("api/auth/refresh/", TokenRefreshView.as_view(), name="token-refresh"),
+    path("api/", include(users_alias_router.urls)),
     path("api/accounts/", include("apps.accounts.urls")),
     path("api/companies/", include("apps.companies.urls")),
     path("api/organization/", include("apps.organization.urls")),
