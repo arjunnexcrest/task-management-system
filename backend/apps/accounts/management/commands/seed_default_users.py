@@ -254,3 +254,4 @@ class Command(BaseCommand):
                 f"Done: seeded 5 login accounts, {len(roles_by_code)} roles, company='{company.name}', enrolled in {len(active_projects)} project(s)."
             )
         )
+

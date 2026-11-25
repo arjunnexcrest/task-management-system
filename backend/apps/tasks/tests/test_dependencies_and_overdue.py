@@ -516,3 +516,4 @@ class TaskDependenciesAndOverdueTestCase(APITestCase):
         self.assertTrue(by_id[str(t_over.id)]["is_overdue"])
         self.assertEqual(by_id[str(t_over.id)]["overdue_severity"], "Critical")
         self.assertTrue(by_id[str(t_soon.id)]["is_dependency_blocked"])
+

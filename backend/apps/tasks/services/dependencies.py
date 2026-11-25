@@ -1475,3 +1475,4 @@ def check_and_notify_deadlines_service(
         "skipped_duplicates": skipped_duplicates,
         "alerts": alerts[:100],
     }
+

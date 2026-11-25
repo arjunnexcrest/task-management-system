@@ -105,3 +105,4 @@ class AuthenticationEndpointsTest(TestCase):
             format="json",
         )
         self.assertEqual(suspended_resp.status_code, status.HTTP_403_FORBIDDEN)
+
