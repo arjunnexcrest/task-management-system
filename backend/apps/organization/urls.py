@@ -15,6 +15,52 @@ router.register(r"teams", TeamViewSet, basename="team")
 router.register(r"team-memberships", TeamMembershipViewSet, basename="team-membership")
 router.register(r"reporting-relationships", ReportingRelationshipViewSet, basename="reporting-relationship")
 
+# Standalone router for mounting directly at /api/departments/
+department_only_router = DefaultRouter()
+department_only_router.register(r"", DepartmentViewSet, basename="departments-api")
+
+department_only_urlpatterns = [
+    path(
+        "<uuid:pk>/assign-head/",
+        DepartmentViewSet.as_view({"post": "assign_head"}),
+        name="departments-api-assign-head-hyphen",
+    ),
+    path("", include(department_only_router.urls)),
+]
+
+# Standalone router for mounting directly at /api/teams/
+team_only_router = DefaultRouter()
+team_only_router.register(r"", TeamViewSet, basename="teams-api")
+
+team_only_urlpatterns = [
+    path(
+        "<uuid:pk>/assign-leader/",
+        TeamViewSet.as_view({"post": "assign_leader"}),
+        name="teams-api-assign-leader-hyphen",
+    ),
+    path("", include(team_only_router.urls)),
+]
+
+# Standalone router for mounting directly at /api/reporting-relationships/
+reporting_only_router = DefaultRouter()
+reporting_only_router.register(
+    r"", ReportingRelationshipViewSet, basename="reporting-relationships-api"
+)
+
+reporting_only_urlpatterns = [
+    path("", include(reporting_only_router.urls)),
+]
+
 urlpatterns = [
+    path(
+        "departments/<uuid:pk>/assign-head/",
+        DepartmentViewSet.as_view({"post": "assign_head"}),
+        name="department-assign-head-hyphen",
+    ),
+    path(
+        "teams/<uuid:pk>/assign-leader/",
+        TeamViewSet.as_view({"post": "assign_leader"}),
+        name="team-assign-leader-hyphen",
+    ),
     path("", include(router.urls)),
 ]

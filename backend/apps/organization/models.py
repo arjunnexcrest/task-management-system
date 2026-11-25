@@ -33,6 +33,18 @@ class Department(models.Model):
     def __str__(self):
         return f"{self.name} ({self.company.code})"
 
+    @property
+    def is_active(self) -> bool:
+        return self.status == self.Status.ACTIVE
+
+    def deactivate(self):
+        self.status = self.Status.INACTIVE
+        self.save(update_fields=["status", "updated_at"])
+
+    def activate(self):
+        self.status = self.Status.ACTIVE
+        self.save(update_fields=["status", "updated_at"])
+
 
 class DepartmentMembership(models.Model):
     class Status(models.TextChoices):
@@ -94,6 +106,18 @@ class Team(models.Model):
 
     def __str__(self):
         return f"{self.name} ({self.department.name})"
+
+    @property
+    def is_active(self) -> bool:
+        return self.status == self.Status.ACTIVE
+
+    def deactivate(self):
+        self.status = self.Status.INACTIVE
+        self.save(update_fields=["status"])
+
+    def activate(self):
+        self.status = self.Status.ACTIVE
+        self.save(update_fields=["status"])
 
 
 class TeamMembership(models.Model):

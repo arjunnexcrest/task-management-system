@@ -140,7 +140,10 @@ def lookup_data(request):
         )
 
     user_company_ids: dict[str, list[str]] = {}
-    for cm in CompanyMembership.objects.filter(status=CompanyMembership.Status.ACTIVE):
+    for cm in CompanyMembership.objects.filter(
+        is_active=True,
+        status=CompanyMembership.Status.ACTIVE,
+    ):
         user_company_ids.setdefault(str(cm.user_id), []).append(str(cm.company_id))
 
     users = []
@@ -173,6 +176,14 @@ def lookup_data(request):
     )
 
 
+from apps.accounts.urls import user_only_router
+from apps.companies.urls import membership_router
+from apps.organization.urls import (
+    department_only_urlpatterns,
+    reporting_only_urlpatterns,
+    team_only_urlpatterns,
+)
+
 urlpatterns = [
     path("", api_root, name="api-root"),
     path("admin/", admin.site.urls),
@@ -188,6 +199,14 @@ urlpatterns = [
         SpectacularRedocView.as_view(url_name="schema"),
         name="redoc",
     ),
+    # Auth, Users, Employees, Memberships, Departments, Teams & Reporting APIs
+    path("api/auth/", include("apps.accounts.urls")),
+    path("api/users/", include(user_only_router.urls)),
+    path("api/employees/", include(user_only_router.urls)),
+    path("api/memberships/", include(membership_router.urls)),
+    path("api/departments/", include(department_only_urlpatterns)),
+    path("api/teams/", include(team_only_urlpatterns)),
+    path("api/reporting-relationships/", include(reporting_only_urlpatterns)),
     # All 13 SRS & Database Design Module APIs Wired
     path("api/accounts/", include("apps.accounts.urls")),
     path("api/companies/", include("apps.companies.urls")),

@@ -1,4 +1,4 @@
-from apps.companies.models import CompanyMembership
+from apps.common.permissions import get_user_company_ids, is_ceo
 
 
 def get_active_company_id(request):
@@ -25,11 +25,10 @@ def scope_queryset_by_company(queryset, request, company_lookup="company_id"):
         queryset = queryset.filter(**{company_lookup: active_company_id})
 
     user = getattr(request, "user", None)
-    if user and user.is_authenticated and not user.is_superuser:
-        authorized_company_ids = CompanyMembership.objects.filter(
-            user=user,
-            status=CompanyMembership.Status.ACTIVE,
-        ).values_list("company_id", flat=True)
+    if user and user.is_authenticated and not is_ceo(user):
+        authorized_company_ids = get_user_company_ids(user)
+        if not authorized_company_ids:
+            return queryset.none()
         queryset = queryset.filter(**{f"{company_lookup}__in": authorized_company_ids})
 
     return queryset
