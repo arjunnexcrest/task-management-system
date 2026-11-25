@@ -165,6 +165,10 @@ class Task(models.Model):
                     )
                     self.progress = Decimal(f"{round(weighted_sum / total_weight, 2):.2f}")
                     self.save(update_fields=["progress", "updated_at"])
+            else:
+                if self.progress != Decimal("0.00") and self.status != self.Status.COMPLETED:
+                    self.progress = Decimal("0.00")
+                    self.save(update_fields=["progress", "updated_at"])
         elif self.progress_method == self.ProgressMethod.CHECKLIST:
             items = ChecklistItem.objects.filter(checklist__task=self)
             total = items.count()
@@ -173,6 +177,10 @@ class Task(models.Model):
                 pct = round((done / total) * 100.0, 2)
                 self.progress = Decimal(f"{pct:.2f}")
                 self.save(update_fields=["progress", "updated_at"])
+            else:
+                if self.progress != Decimal("0.00") and self.status != self.Status.COMPLETED:
+                    self.progress = Decimal("0.00")
+                    self.save(update_fields=["progress", "updated_at"])
         if self.parent_task_id:
             self.parent_task.recalculate_auto_progress()
         elif self.project_id:
@@ -184,6 +192,10 @@ class Task(models.Model):
         if self.status == self.Status.COMPLETED and not self.completed_at:
             self.completed_at = timezone.now()
             self.progress = Decimal("100.00")
+            if "update_fields" in kwargs and kwargs["update_fields"] is not None:
+                uf = set(kwargs["update_fields"])
+                uf.update({"completed_at", "progress"})
+                kwargs["update_fields"] = list(uf)
         super().save(*args, **kwargs)
         if self.parent_task_id:
             self.parent_task.recalculate_auto_progress()

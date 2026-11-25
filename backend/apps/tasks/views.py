@@ -1,5 +1,6 @@
 from pathlib import Path
 from django.conf import settings
+from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.http import HttpResponse
@@ -227,11 +228,13 @@ class TaskViewSet(viewsets.ModelViewSet):
                 override_dependencies=bool(request.data.get("override_dependencies", False)),
                 override_reason=request.data.get("override_reason"),
             )
+        except DjangoPermissionDenied as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_403_FORBIDDEN)
         except DjangoValidationError as exc:
             msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
             return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
         refreshed = get_task_detail_queryset(request).get(pk=updated.pk)
-        return Response(TaskDetailSerializer(refreshed).data)
+        return Response(TaskDetailSerializer(refreshed, context={"request": request}).data)
 
     @action(detail=True, methods=["get"], url_path="dependency-impact")
     def dependency_impact(self, request, pk=None):
@@ -495,6 +498,8 @@ class TaskViewSet(viewsets.ModelViewSet):
             if raw_approval_req in (None, "")
             else str(raw_approval_req).lower() in ("true", "1", "yes")
         )
+        raw_override_deps = request.data.get("override_dependencies")
+        override_deps = str(raw_override_deps).lower() in ("true", "1", "yes") if raw_override_deps not in (None, "") else False
         try:
             submit_for_review_service(
                 task=task,
@@ -504,6 +509,8 @@ class TaskViewSet(viewsets.ModelViewSet):
                 attachment_ids=attachment_ids,
                 uploaded_files=uploaded,
                 approval_required=approval_req,
+                override_dependencies=override_deps,
+                override_reason=request.data.get("override_reason"),
             )
         except DjangoPermissionDenied as exc:
             return Response({"error": str(exc)}, status=status.HTTP_403_FORBIDDEN)
@@ -512,7 +519,7 @@ class TaskViewSet(viewsets.ModelViewSet):
             return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
 
         refreshed = get_task_detail_queryset(request).get(pk=task.pk)
-        return Response(TaskDetailSerializer(refreshed).data)
+        return Response(TaskDetailSerializer(refreshed, context={"request": request}).data)
 
     @action(detail=True, methods=["post"], url_path="reassign-reviewer")
     def reassign_reviewer(self, request, pk=None):
@@ -544,7 +551,7 @@ class TaskViewSet(viewsets.ModelViewSet):
             return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
 
         refreshed = get_task_detail_queryset(request).get(pk=task.pk)
-        return Response(TaskDetailSerializer(refreshed).data)
+        return Response(TaskDetailSerializer(refreshed, context={"request": request}).data)
 
     @action(detail=True, methods=["get", "post"], url_path="review-chain")
     def review_chain(self, request, pk=None):
@@ -688,7 +695,7 @@ class TaskViewSet(viewsets.ModelViewSet):
     def kanban(self, request):
         tasks = self.filter_queryset(self.get_queryset().filter(parent_task__isnull=True))
         columns = {s[0]: [] for s in Task.Status.choices}
-        for item in TaskSerializer(tasks, many=True).data:
+        for item in TaskSerializer(tasks, many=True, context={"request": request}).data:
             if item["status"] in columns:
                 columns[item["status"]].append(item)
         return Response(columns)

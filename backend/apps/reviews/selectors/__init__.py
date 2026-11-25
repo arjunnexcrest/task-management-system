@@ -53,6 +53,7 @@ def get_review_queue_queryset(request=None, queue_tab: str = "pending"):
             "assignments__team",
             "task_attachments__attachment__uploaded_by",
             "comments__comment_attachments__attachment__uploaded_by",
+            "dependencies__depends_on_task",
             "subtasks",
         )
         .annotate(

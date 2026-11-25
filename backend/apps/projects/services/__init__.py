@@ -884,12 +884,40 @@ def delete_project_service(*, project: Project, force: bool = True) -> None:
 @transaction.atomic
 def recalculate_project_progress_service(*, project: Project) -> Project:
     """
-    Recalculates overall project completion percentage from top-level non-cancelled tasks (SRS §6.5 & §22 #13).
+    Recalculates overall project completion percentage from top-level non-cancelled tasks
+    (SRS §6.5 & §22 #13), and synchronizes linked phase & milestone progress rollups.
     """
-    top_tasks = project.tasks.filter(parent_task__isnull=True).exclude(status="Cancelled")
-    total = top_tasks.count()
+    from decimal import Decimal
+
+    top_tasks = list(project.tasks.filter(parent_task__isnull=True).exclude(status="Cancelled"))
+    total = len(top_tasks)
     if total > 0:
         avg_progress = sum(float(t.progress) for t in top_tasks) / total
-        project.progress = round(avg_progress, 2)
-        project.save(update_fields=["progress"])
+        project.progress = Decimal(f"{round(avg_progress, 2):.2f}")
+    else:
+        project.progress = Decimal("0.00")
+    project.save(update_fields=["progress"])
+
+    # Roll up progress to ProjectPhases that have linked tasks
+    for phase in project.phases.all():
+        phase_tasks = [t for t in top_tasks if t.phase_id == phase.id]
+        if phase_tasks:
+            p_avg = round(sum(float(t.progress) for t in phase_tasks) / len(phase_tasks), 2)
+            new_prog = Decimal(f"{p_avg:.2f}")
+            if phase.progress != new_prog:
+                phase.progress = new_prog
+                phase.save(update_fields=["progress"])
+
+    # Roll up progress to ProjectMilestones that have linked MilestoneTasks
+    for ms in project.milestones.prefetch_related("milestone_tasks__task").all():
+        linked = [
+            mt.task for mt in ms.milestone_tasks.all() if mt.task and mt.task.status != "Cancelled"
+        ]
+        if linked:
+            m_avg = round(sum(float(t.progress) for t in linked) / len(linked), 2)
+            new_prog = Decimal(f"{m_avg:.2f}")
+            if ms.progress != new_prog:
+                ms.progress = new_prog
+                ms.save(update_fields=["progress"])
+
     return project

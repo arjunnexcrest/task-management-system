@@ -1,7 +1,9 @@
+from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.utils import timezone
 from rest_framework import serializers
+from rest_framework.exceptions import PermissionDenied as DrfPermissionDenied
 from apps.accounts.models import User
 from apps.common.serializers import CompanyScopedValidationMixin
 from apps.notifications.models import Notification
@@ -888,6 +890,8 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
                     new_status=requested_status,
                     actor=actor,
                 )
+            except DjangoPermissionDenied as exc:
+                raise DrfPermissionDenied(str(exc))
             except DjangoValidationError as exc:
                 msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
                 raise serializers.ValidationError({"status": msg})
@@ -986,7 +990,13 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
         return count
 
     def get_allowed_transitions(self, obj):
-        return get_allowed_next_statuses(task=obj)
+        request = self.context.get("request")
+        actor = (
+            request.user
+            if request and getattr(request, "user", None) and request.user.is_authenticated
+            else None
+        )
+        return get_allowed_next_statuses(task=obj, actor=actor)
 
     def get_subtasks_count(self, obj):
         if hasattr(obj, "annotated_subtasks_count"):

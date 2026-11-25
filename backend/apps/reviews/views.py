@@ -114,8 +114,10 @@ class TaskReviewViewSet(viewsets.ModelViewSet):
 
         page = self.paginate_queryset(qs)
         if page is not None:
-            return self.get_paginated_response(ReviewQueueTaskSerializer(page, many=True).data)
-        return Response(ReviewQueueTaskSerializer(qs, many=True).data)
+            return self.get_paginated_response(
+                ReviewQueueTaskSerializer(page, many=True, context={"request": request}).data
+            )
+        return Response(ReviewQueueTaskSerializer(qs, many=True, context={"request": request}).data)
 
     @action(detail=False, methods=["get"])
     def summary(self, request):
@@ -160,6 +162,13 @@ class TaskReviewViewSet(viewsets.ModelViewSet):
             else str(raw_approval_req).lower() in ("true", "1", "yes")
         )
 
+        raw_override_deps = request.data.get("override_dependencies")
+        override_deps = (
+            str(raw_override_deps).lower() in ("true", "1", "yes")
+            if raw_override_deps not in (None, "")
+            else False
+        )
+
         try:
             updated_task = submit_for_review_service(
                 task=task,
@@ -169,6 +178,8 @@ class TaskReviewViewSet(viewsets.ModelViewSet):
                 attachment_ids=attachment_ids,
                 uploaded_files=uploaded_files,
                 approval_required=approval_req,
+                override_dependencies=override_deps,
+                override_reason=request.data.get("override_reason"),
             )
         except DjangoPermissionDenied as exc:
             return Response({"error": str(exc)}, status=status.HTTP_403_FORBIDDEN)
@@ -177,7 +188,10 @@ class TaskReviewViewSet(viewsets.ModelViewSet):
             return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
 
         refreshed = get_review_queue_queryset(request, queue_tab="all").filter(id=updated_task.id).first() or updated_task
-        return Response(ReviewQueueTaskSerializer(refreshed).data, status=status.HTTP_200_OK)
+        return Response(
+            ReviewQueueTaskSerializer(refreshed, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
 
     @action(
         detail=False,

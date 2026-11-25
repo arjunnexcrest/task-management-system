@@ -1,5 +1,5 @@
 from datetime import date
-from django.core.exceptions import ValidationError
+from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import transaction
 from django.utils import timezone
 from apps.accounts.models import User
@@ -689,11 +689,30 @@ DEFAULT_TASK_TRANSITIONS: dict[str, list[str]] = {
 }
 
 
+def _actor_satisfies_transition_role(*, task: Task, actor, role) -> bool:
+    if role is None or actor is None or not getattr(actor, "is_authenticated", False):
+        return True
+    if getattr(actor, "is_superuser", False):
+        return True
+    role_code = (getattr(role, "code", "") or "").upper()
+    if role_code == "PROJECT_MANAGER" and task.project.project_manager_id == actor.id:
+        return True
+    from apps.rbac.models import MembershipRole
+
+    return MembershipRole.objects.filter(
+        membership__company_id=task.project.company_id,
+        membership__user=actor,
+        membership__status=CompanyMembership.Status.ACTIVE,
+        role_id=role.id,
+    ).exists()
+
+
 def get_allowed_next_statuses(*, task: Task, actor=None) -> list[str]:
     """
-    SRS §7.3, §20.2 & DB Design §4.7 (`workflow_statuses`, `workflow_transitions`):
+    SRS §7.3, §14.1, §14.3, §20.2 & DB Design §4.7 (`workflow_statuses`, `workflow_transitions`):
     Resolves permitted next statuses from company-scoped or global WorkflowTransition rows
-    if configured, otherwise falls back to SRS §7.3 DEFAULT_TASK_TRANSITIONS.
+    (respecting role restrictions when configured), otherwise falls back to SRS §7.3
+    DEFAULT_TASK_TRANSITIONS, and applies approval/reviewer workflow guards.
     """
     from apps.system_settings.models import WorkflowTransition
 
@@ -711,18 +730,46 @@ def get_allowed_next_statuses(*, task: Task, actor=None) -> list[str]:
 
     if configured_qs.exists():
         outgoing = [
-            tr for tr in configured_qs if tr.from_status.status_code == task.status and tr.to_status.is_active
+            tr
+            for tr in configured_qs
+            if tr.from_status.status_code == task.status
+            and tr.to_status.is_active
+            and _actor_satisfies_transition_role(task=task, actor=actor, role=tr.role)
         ]
         allowed = [tr.to_status.status_code for tr in outgoing]
     else:
         allowed = list(DEFAULT_TASK_TRANSITIONS.get(task.status, []))
 
-    # Enforce SRS §14.3: if approval_required and not yet approved, Completed is not directly reachable
-    if task.approval_required and Task.Status.COMPLETED in allowed:
+    # Enforce SRS §14.1 & §14.3 approval workflow integration rules
+    if Task.Status.COMPLETED in allowed and task.approval_required:
         from apps.reviews.services import is_task_approval_satisfied
 
         if not is_task_approval_satisfied(task) and task.status != Task.Status.APPROVED:
             allowed = [s for s in allowed if s != Task.Status.COMPLETED]
+
+    if Task.Status.APPROVED in allowed or Task.Status.CHANGES_REQUESTED in allowed:
+        from apps.reviews.permissions import is_user_authorized_reviewer
+        from apps.reviews.services import resolve_task_approval_chain
+
+        chain = resolve_task_approval_chain(task)
+        chain_user_ids = {s["user_id"] for s in chain["steps"] if s.get("user_id")}
+
+        # Multi-level chains cannot jump straight to Approved via generic workflow transition
+        if (
+            Task.Status.APPROVED in allowed
+            and chain["total_steps"] > 1
+            and not chain["is_chain_satisfied"]
+        ):
+            allowed = [s for s in allowed if s != Task.Status.APPROVED]
+
+        # Authenticated non-reviewers cannot self-approve or mark Changes Requested
+        if actor is not None and getattr(actor, "is_authenticated", False):
+            if not is_user_authorized_reviewer(task, actor, extra_chain_user_ids=chain_user_ids):
+                allowed = [
+                    s
+                    for s in allowed
+                    if s not in (Task.Status.APPROVED, Task.Status.CHANGES_REQUESTED)
+                ]
 
     # Deduplicate preserving order
     seen = set()
@@ -741,14 +788,14 @@ def transition_task_status_service(
     override_reason: str | None = None,
 ) -> Task:
     """
-    SRS §7.3, §7.9, §8.3, §12.2, §14.3 & §22 Core Business Rules #3, #5, #7, #9, #20:
+    SRS §7.3, §7.9, §8.3, §12.2, §14.1–§14.3 & §22 Core Business Rules #3, #5, #7, #9, #20:
     Atomically transitions a task's workflow status while validating:
-    1. Permitted transition path (configured WorkflowTransition or SRS §7.3 defaults)
+    1. Permitted transition path (configured WorkflowTransition + role guard or SRS §7.3 defaults)
     2. Responsible owner / active assignee before active execution
     3. Prerequisite task dependencies (FS, SS, FF, SF) unless authorized override with reason
-    4. Required review/approval before Completed
-    5. Mandatory subtask completion before parent completion (unless authorized override with reason)
-    6. Traceable status-change comment, delay impact warnings, notifications, and progress recalculation
+    4. Reviewer permissions & multi-level approval chain integrity on Approved / Changes Requested
+    5. Required review/approval & subtask completion before Completed (with approval-cycle reset on reopen)
+    6. Immutable TaskReview sync, traceable status-change comment, delay impact warnings, notifications, and progress rollup
     """
     valid_statuses = {choice[0] for choice in Task.Status.choices}
     if new_status not in valid_statuses:
@@ -758,12 +805,42 @@ def transition_task_status_service(
     if new_status == old_status:
         return task
 
-    # 1. Validate transition path (SRS §7.3 & §22 #5)
+    is_auth_actor = bool(actor is not None and getattr(actor, "is_authenticated", False))
+
+    # 1. Explicit approval-chain & reviewer permission checks BEFORE generic allowed check
+    #    so callers get precise 403/400 messages instead of generic "Invalid transition".
+    from apps.reviews.models import TaskReview
+    from apps.reviews.permissions import is_user_authorized_reviewer
+    from apps.reviews.services import (
+        _create_notification_with_delivery,
+        is_task_approval_satisfied,
+        resolve_task_approval_chain,
+    )
+
+    chain_before = resolve_task_approval_chain(task)
+    chain_user_ids = {s["user_id"] for s in chain_before["steps"] if s.get("user_id")}
+
+    if new_status in (Task.Status.APPROVED, Task.Status.CHANGES_REQUESTED):
+        if is_auth_actor and not is_user_authorized_reviewer(
+            task, actor, extra_chain_user_ids=chain_user_ids
+        ):
+            raise PermissionDenied(
+                f"User '{actor.full_name}' is not authorized to move task '{task.title}' to '{new_status}' (SRS §14.2 & §22 #20)."
+            )
+        if (
+            new_status == Task.Status.APPROVED
+            and chain_before["total_steps"] > 1
+            and not chain_before["is_chain_satisfied"]
+        ):
+            raise ValidationError(
+                f"Multi-level approval chain active ({chain_before['total_steps']} steps, currently Step "
+                f"{chain_before['current_step_number']} — {chain_before['current_step_role']}). "
+                f"Complete sequential approvals via the Review & Approval workflow instead of jumping directly to Approved (SRS §14.1 & §14.3)."
+            )
+
+    # 2. Validate transition path (SRS §7.3 & §22 #5)
     allowed_next = get_allowed_next_statuses(task=task, actor=actor)
     if new_status not in allowed_next:
-        from apps.reviews.services import is_task_approval_satisfied
-
-        # Also give a specific, helpful message if approval_required prevented direct completion
         if (
             new_status == Task.Status.COMPLETED
             and task.approval_required
@@ -778,7 +855,7 @@ def transition_task_status_service(
             f"Invalid status transition from '{old_status}' to '{new_status}'. Permitted next statuses: {allowed_label} (SRS §7.3 & §22 #5)."
         )
 
-    # 2. Enforce responsible owner / active assignee before active execution (SRS §22 #3)
+    # 3. Enforce responsible owner / active assignee before active execution (SRS §22 #3)
     if new_status in (Task.Status.IN_PROGRESS, Task.Status.IN_REVIEW, Task.Status.COMPLETED):
         has_active_assignment = task.assignments.filter(status__in=["Active", "Acknowledged"]).exists()
         if not task.task_owner_id and not has_active_assignment:
@@ -786,7 +863,7 @@ def transition_task_status_service(
                 f"Task must have a responsible Task Owner or active assignee before moving to '{new_status}' (SRS §22 #3)."
             )
 
-    # 2b. Enforce prerequisite task dependencies across FS/SS/FF/SF (SRS §7.9 & §22 #20)
+    # 4. Enforce prerequisite task dependencies across FS/SS/FF/SF (SRS §7.9 & §22 #20)
     check_dependency_rules_for_transition(
         task=task,
         new_status=new_status,
@@ -794,11 +871,10 @@ def transition_task_status_service(
         override_reason=override_reason,
     )
 
-    # 3. Enforce approval & subtask completion rules when completing (SRS §8.3, §14.3, §22 #7, #9)
+    # 5. Enforce approval & subtask completion rules when completing (SRS §8.3, §14.3, §22 #7, #9)
+    reopened_from_completed = False
     if new_status == Task.Status.COMPLETED:
         if task.approval_required:
-            from apps.reviews.services import is_task_approval_satisfied
-
             if not is_task_approval_satisfied(task) and old_status != Task.Status.APPROVED:
                 raise ValidationError(
                     "Task requires approval before it can be marked Completed (SRS §14.3 & §22 #7)."
@@ -819,25 +895,51 @@ def transition_task_status_service(
         task.completed_at = timezone.now()
         task.progress = 100.00
     elif old_status == Task.Status.COMPLETED and new_status != Task.Status.COMPLETED:
-        # Reopening a completed task clears completed_at
+        # Reopening a completed task clears completed_at and resets approval cycle (SRS §14.3)
         task.completed_at = None
+        reopened_from_completed = True
 
-    # Auto-assign Step 1 reviewer from configured approval chain if moving to In Review without one
-    if new_status == Task.Status.IN_REVIEW and not task.reviewer_id:
-        from apps.reviews.services import resolve_task_approval_chain
-
-        chain = resolve_task_approval_chain(task)
-        first_rev_id = chain.get("current_reviewer_id") or (
-            chain["steps"][0]["user_id"] if chain["steps"] else None
+    # Auto-align reviewer from configured approval chain when entering In Review
+    if new_status == Task.Status.IN_REVIEW:
+        chain_for_review = resolve_task_approval_chain(task)
+        target_rev_id = chain_for_review.get("current_reviewer_id") or (
+            chain_for_review["steps"][0]["user_id"] if chain_for_review["steps"] else None
         )
-        if first_rev_id:
-            task.reviewer_id = first_rev_id
+        if target_rev_id and (not task.reviewer_id or chain_for_review["total_steps"] > 1):
+            task.reviewer_id = target_rev_id
 
     task.status = new_status
     task.save()
 
-    # 4. Traceable status transition comment (SRS §7.7 & §22 #6)
     author_id = getattr(actor, "id", None) or task.created_by_id
+
+    # 6. Keep immutable `task_reviews` audit log synchronized when transitioning to Approved or Changes Requested
+    if new_status == Task.Status.APPROVED and not chain_before["is_chain_satisfied"]:
+        rev_actor = actor if getattr(actor, "id", None) else (task.reviewer or task.project.project_manager or task.created_by)
+        if rev_actor:
+            TaskReview.objects.create(
+                task=task,
+                reviewer=rev_actor,
+                decision=TaskReview.Decision.APPROVED,
+                comments=(reason or "Approved via task status workflow").strip(),
+                review_round=task.reviews.count() + 1,
+            )
+    elif new_status == Task.Status.CHANGES_REQUESTED and old_status in (
+        Task.Status.IN_REVIEW,
+        Task.Status.APPROVED,
+    ):
+        rev_actor = actor if getattr(actor, "id", None) else (task.reviewer or task.project.project_manager or task.created_by)
+        if rev_actor:
+            TaskReview.objects.create(
+                task=task,
+                reviewer=rev_actor,
+                decision=TaskReview.Decision.CHANGES_REQUESTED,
+                correction_reason=(reason or "Returned for corrections via task status workflow").strip(),
+                comments=(reason or "").strip() or None,
+                review_round=task.reviews.count() + 1,
+            )
+
+    # 7. Traceable status transition comment (SRS §7.7 & §22 #6)
     note_parts = [f"[Status Transition] {old_status} → {new_status}"]
     if reason and reason.strip():
         note_parts.append(f"Reason: {reason.strip()}")
@@ -851,6 +953,13 @@ def transition_task_status_service(
         content=" | ".join(note_parts),
     )
 
+    if reopened_from_completed:
+        TaskComment.objects.create(
+            task=task,
+            author_id=author_id,
+            content=f"[Approval Cycle Reset — Task Reopened] Reopened from Completed to {new_status}; fresh review approval required if approval_required is enabled.",
+        )
+
     # SRS §7.9: Warn managers & downstream owners if prerequisite becomes Blocked or On Hold
     if new_status in (Task.Status.BLOCKED, Task.Status.ON_HOLD):
         notify_dependency_delay_impact(
@@ -860,9 +969,9 @@ def transition_task_status_service(
             dedupe_hours=0,
         )
 
-    # 5. Relevant notifications (SRS §13.1 & §22 #17)
+    # 8. Relevant notifications with delivery tracking (SRS §13.1 & §22 #17)
     if new_status == Task.Status.IN_REVIEW and task.reviewer_id:
-        Notification.objects.create(
+        _create_notification_with_delivery(
             user_id=task.reviewer_id,
             notification_type="REVIEW_REQUESTED",
             title=f"Review Requested: {task.title}",
@@ -871,7 +980,7 @@ def transition_task_status_service(
             related_task=task,
         )
     elif new_status == Task.Status.CHANGES_REQUESTED and task.task_owner_id:
-        Notification.objects.create(
+        _create_notification_with_delivery(
             user_id=task.task_owner_id,
             notification_type="CHANGES_REQUESTED",
             title=f"Changes Requested: {task.title}",
@@ -879,8 +988,17 @@ def transition_task_status_service(
             related_project=task.project,
             related_task=task,
         )
+    elif new_status == Task.Status.APPROVED and task.task_owner_id and task.task_owner_id != author_id:
+        _create_notification_with_delivery(
+            user_id=task.task_owner_id,
+            notification_type="TASK_APPROVED",
+            title=f"Task Approved: {task.title}",
+            message=f"Task '{task.title}' has been approved.",
+            related_project=task.project,
+            related_task=task,
+        )
     elif task.task_owner_id and task.task_owner_id != author_id:
-        Notification.objects.create(
+        _create_notification_with_delivery(
             user_id=task.task_owner_id,
             notification_type="STATUS_CHANGED",
             title=f"Task Status Updated: {task.title}",

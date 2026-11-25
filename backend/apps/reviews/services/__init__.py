@@ -311,8 +311,21 @@ def resolve_task_approval_chain(task: Task) -> dict:
         task.reviews.select_related("reviewer").order_by("review_round", "reviewed_at")
     )
 
+    # Respect approval cycle resets triggered by reopening a Completed task (SRS §14.3)
+    latest_reopen_reset = (
+        TaskComment.objects.filter(
+            task=task, content__startswith="[Approval Cycle Reset"
+        )
+        .order_by("-created_at")
+        .first()
+    )
+    reset_ts = latest_reopen_reset.created_at if latest_reopen_reset else None
+
     last_reset_idx = -1
     for i, rev in enumerate(all_reviews):
+        if reset_ts and rev.reviewed_at <= reset_ts:
+            last_reset_idx = i
+            continue
         if rev.decision in (
             TaskReview.Decision.CHANGES_REQUESTED,
             TaskReview.Decision.REJECTED,
@@ -604,21 +617,43 @@ def submit_for_review_service(
     attachment_ids: list | None = None,
     uploaded_files: list | None = None,
     approval_required: bool | None = None,
+    override_dependencies: bool = False,
+    override_reason: str | None = None,
 ) -> Task:
     """
-    SRS §2.6, §7.3, §13.1 & §14.1:
-    Transitions an eligible task to `In Review`, assigns Step 1 reviewer from the configured
-    approval chain (or requested same-company reviewer), attaches submission deliverables,
+    SRS §2.6, §7.3, §7.9, §13.1 & §14.1:
+    Transitions an eligible task to `In Review`, enforces prerequisite dependency rules
+    (with optional authorized override), assigns the active pending chain reviewer
+    (or requested same-company reviewer), attaches submission deliverables,
     and notifies the reviewer.
     """
-    if task.status in (Task.Status.COMPLETED, Task.Status.CANCELLED):
-        raise ValidationError(f"Cannot submit a '{task.status}' task for review.")
+    eligible_statuses = {
+        Task.Status.TO_DO,
+        Task.Status.ASSIGNED,
+        Task.Status.IN_PROGRESS,
+        Task.Status.CHANGES_REQUESTED,
+        Task.Status.IN_REVIEW,
+    }
+    if task.status not in eligible_statuses:
+        raise ValidationError(
+            f"Cannot submit a '{task.status}' task for review. Move the task to In Progress (or resolve Blocked/On Hold status) first (SRS §7.3 & §14.1)."
+        )
 
     has_active_assign = task.assignments.filter(status__in=["Active", "Acknowledged"]).exists()
     if not task.task_owner_id and not has_active_assign:
         raise ValidationError(
             "Task must have a responsible Task Owner or active assignee before submission for review (SRS §22 #3)."
         )
+
+    # SRS §7.9 & §22 #20: Enforce prerequisite task dependencies on submission for review
+    from apps.tasks.services.dependencies import check_dependency_rules_for_transition
+
+    check_dependency_rules_for_transition(
+        task=task,
+        new_status=Task.Status.IN_REVIEW,
+        override_dependencies=override_dependencies,
+        override_reason=override_reason,
+    )
 
     company = task.project.company
     if actor:
@@ -627,7 +662,7 @@ def submit_for_review_service(
     if approval_required is not None:
         task.approval_required = bool(approval_required)
 
-    # Resolve target reviewer
+    # Resolve target reviewer without accidentally rewinding mid-chain progress
     target_reviewer = None
     if reviewer_id:
         target_reviewer = User.objects.filter(id=reviewer_id, is_active=True).first()
@@ -637,14 +672,14 @@ def submit_for_review_service(
         task.reviewer = target_reviewer
     else:
         chain_preview = resolve_task_approval_chain(task)
-        first_uid = chain_preview.get("current_reviewer_id") or (
+        active_step_uid = chain_preview.get("current_reviewer_id") or (
             chain_preview["steps"][0]["user_id"] if chain_preview["steps"] else None
         )
-        if not task.reviewer_id and first_uid:
-            task.reviewer_id = first_uid
-        elif chain_preview["total_steps"] > 1 and chain_preview["steps"][0]["user_id"]:
-            # Reset to Step 1 of multi-step chain when submitting / resubmitting
-            task.reviewer_id = chain_preview["steps"][0]["user_id"]
+        if not task.reviewer_id and active_step_uid:
+            task.reviewer_id = active_step_uid
+        elif chain_preview["total_steps"] > 1 and active_step_uid:
+            # Align to current pending step (Step 1 on fresh/rework, or next pending step if updating mid-review)
+            task.reviewer_id = active_step_uid
         target_reviewer = task.reviewer
 
     old_status = task.status
@@ -659,6 +694,11 @@ def submit_for_review_service(
             f"[Submitted for Review] {old_status} → In Review"
             + (f" | Assigned Reviewer: {target_reviewer.full_name}" if target_reviewer else "")
             + (f" | Notes: {notes.strip()}" if notes and notes.strip() else "")
+            + (
+                f" | Dependency Override: {override_reason.strip()}"
+                if override_dependencies and override_reason and override_reason.strip()
+                else ""
+            )
         ),
     )
 
@@ -715,8 +755,18 @@ def submit_review_decision_service(
     if not reviewer:
         raise ValidationError("A reviewer user is required (DB Design §4.6 & §5).")
 
-    if task.status == Task.Status.CANCELLED:
-        raise ValidationError("Cannot record a review decision on a Cancelled task.")
+    if task.status in (Task.Status.COMPLETED, Task.Status.CANCELLED, Task.Status.BLOCKED):
+        raise ValidationError(
+            f"Cannot record a review decision on a '{task.status}' task. Reopen or unblock the task and submit it for review first (SRS §7.3 & §14.2)."
+        )
+
+    if enforce_actor_permission and task.status not in (
+        Task.Status.IN_REVIEW,
+        Task.Status.APPROVED,
+    ):
+        raise ValidationError(
+            f"Task '{task.title}' is currently '{task.status}'. Submit the task for review ('In Review') before recording a review decision (SRS §14.1 & §14.2)."
+        )
 
     valid_decisions = {c[0] for c in TaskReview.Decision.choices}
     if decision not in valid_decisions:
@@ -732,6 +782,14 @@ def submit_review_decision_service(
     _validate_user_in_project_company(reviewer, company, label="Reviewer")
 
     chain_before = resolve_task_approval_chain(task)
+    if (
+        decision == TaskReview.Decision.APPROVED
+        and task.status == Task.Status.APPROVED
+        and chain_before["is_chain_satisfied"]
+    ):
+        raise ValidationError(
+            "Task is already Approved and all approval chain steps are satisfied (SRS §14.3)."
+        )
     chain_user_ids = {s["user_id"] for s in chain_before["steps"] if s.get("user_id")}
 
     if enforce_actor_permission:
@@ -903,24 +961,41 @@ def reassign_reviewer_service(
         )
 
     old_reviewer = task.reviewer
+    chain_before = resolve_task_approval_chain(task)
+
     task.reviewer = new_reviewer
     task.save(update_fields=["reviewer", "updated_at"])
 
-    # If a task custom chain exists, pin current pending step override to the new reviewer
-    chain_before = resolve_task_approval_chain(task)
-    task_setting = SystemSetting.objects.filter(
-        company=company, setting_key=f"task_approval_chain:{task.id}"
-    ).first()
-    if task_setting and isinstance(task_setting.setting_value, dict):
-        s_val = dict(task_setting.setting_value)
-        overrides = dict(s_val.get("user_overrides") or {})
-        curr_step_num = chain_before.get("current_step_number")
-        if curr_step_num:
+    # Pin the current pending approval chain step to `new_reviewer` even when using
+    # a Company or Project policy chain, so the stepper & sequential check stay in sync!
+    curr_step_num = chain_before.get("current_step_number")
+    if curr_step_num and not chain_before.get("is_approval_satisfied"):
+        task_setting = SystemSetting.objects.filter(
+            company=company, setting_key=f"task_approval_chain:{task.id}"
+        ).first()
+        if task_setting and isinstance(task_setting.setting_value, dict):
+            s_val = dict(task_setting.setting_value)
+            overrides = dict(s_val.get("user_overrides") or {})
             overrides[str(curr_step_num)] = str(new_reviewer.id)
             s_val["user_overrides"] = overrides
             task_setting.setting_value = s_val
             task_setting.updated_by = actor if getattr(actor, "id", None) else task_setting.updated_by
             task_setting.save()
+        elif chain_before["total_steps"] > 1 or chain_before.get("current_reviewer_id") != str(new_reviewer.id):
+            overrides = dict(rules.get("user_overrides") or {})
+            overrides[str(curr_step_num)] = str(new_reviewer.id)
+            SystemSetting.objects.update_or_create(
+                company=company,
+                setting_key=f"task_approval_chain:{task.id}",
+                defaults={
+                    "setting_value": {
+                        "levels": list(rules["levels"]),
+                        "user_overrides": overrides,
+                        "escalation_hours": rules["escalation_hours"],
+                    },
+                    "updated_by": actor if getattr(actor, "id", None) else None,
+                },
+            )
 
     comment_author = actor or task.project.project_manager or task.created_by
     reason_part = f" | Reason: {reason.strip()}" if reason and reason.strip() else ""

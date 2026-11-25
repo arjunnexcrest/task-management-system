@@ -8,8 +8,12 @@ from apps.accounts.models import User
 from apps.notifications.models import Notification
 from apps.risks.models import Blocker
 from apps.system_settings.models import SystemSetting
-from apps.tasks.models import Attachment, Task, TaskAttachment
-from apps.tasks.services import _validate_user_in_project_company
+from apps.tasks.models import Attachment, Task, TaskAttachment, TaskComment
+from apps.tasks.services import (
+    _validate_user_in_project_company,
+    evaluate_task_dependencies,
+    notify_dependency_delay_impact,
+)
 from apps.tracking.models import ProgressAttachment, ProgressUpdate, TimeEntry
 
 
@@ -50,8 +54,10 @@ def submit_progress_update_service(
     company = task.project.company
     _validate_user_in_project_company(author, company, label="Progress update author")
 
-    if task.status == Task.Status.CANCELLED:
-        raise ValidationError("Cannot submit progress updates for a cancelled task.")
+    if task.status in (Task.Status.COMPLETED, Task.Status.CANCELLED):
+        raise ValidationError(
+            f"Cannot submit progress updates for a '{task.status}' task. Reopen the task first."
+        )
 
     try:
         pct_val = Decimal(str(progress_percentage))
@@ -105,14 +111,19 @@ def submit_progress_update_service(
         task.progress = pct_val
         task_update_fields.append("progress")
 
-    # Auto-transition task to In Progress when work starts and task has a responsible owner
+    # Auto-transition task to In Progress when work starts, task has an owner,
+    # and start prerequisite dependencies are satisfied (SRS §7.9 & §22 #3, #20)
+    auto_started_from = None
     if (
         pct_val > Decimal("0.00")
         and task.status in [Task.Status.BACKLOG, Task.Status.TO_DO, Task.Status.ASSIGNED]
         and task.task_owner_id
     ):
-        task.status = Task.Status.IN_PROGRESS
-        task_update_fields.append("status")
+        dep_eval = evaluate_task_dependencies(task)
+        if not dep_eval["unsatisfied_for_start"]:
+            auto_started_from = task.status
+            task.status = Task.Status.IN_PROGRESS
+            task_update_fields.append("status")
 
     if task_update_fields:
         task_update_fields.append("updated_at")
@@ -120,6 +131,13 @@ def submit_progress_update_service(
     else:
         # Ensure automatic calculation methods stay fresh and roll up to parent/project
         task.recalculate_auto_progress()
+
+    if auto_started_from:
+        TaskComment.objects.create(
+            task=task,
+            author=author,
+            content=f"[Status Transition] {auto_started_from} → In Progress | Reason: Progress update recorded ({pct_val}%)",
+        )
 
     # SRS §9.1 & §9.2: Record manual TimeEntry when time_spent_minutes > 0
     if instance.time_spent_minutes and instance.time_spent_minutes > 0:
@@ -171,8 +189,20 @@ def submit_progress_update_service(
             Task.Status.CANCELLED,
             Task.Status.BLOCKED,
         ]:
+            prev_status = task.status
             task.status = Task.Status.BLOCKED
             task.save(update_fields=["status", "updated_at"])
+            TaskComment.objects.create(
+                task=task,
+                author=author,
+                content=f"[Status Transition] {prev_status} → Blocked | Reason: Blocker reported — {blocker_text[:150]}",
+            )
+            notify_dependency_delay_impact(
+                task=task,
+                trigger_reason="Blocker reported — task moved to Blocked",
+                actor=author,
+                dedupe_hours=0,
+            )
 
         blocker_targets = {
             str(uid)

@@ -6,7 +6,12 @@ from rest_framework.exceptions import PermissionDenied as DrfPermissionDenied
 from apps.accounts.models import User
 from apps.tasks.models import Task
 from apps.tasks.serializers import AttachmentSerializer
-from apps.tasks.services import get_allowed_next_statuses
+from apps.tasks.services import (
+    compute_task_schedule_metrics,
+    evaluate_task_dependencies,
+    get_allowed_next_statuses,
+    get_company_working_calendar,
+)
 from .models import TaskReview
 from .services import (
     compute_task_review_sla,
@@ -152,6 +157,13 @@ class ReviewQueueTaskSerializer(serializers.ModelSerializer):
         source="reviewer.full_name", read_only=True, default=None
     )
     is_subtask = serializers.BooleanField(read_only=True)
+    is_overdue = serializers.SerializerMethodField()
+    days_overdue = serializers.SerializerMethodField()
+    working_days_overdue = serializers.SerializerMethodField()
+    due_status = serializers.SerializerMethodField()
+    is_dependency_blocked = serializers.SerializerMethodField()
+    blocking_prerequisites_count = serializers.SerializerMethodField()
+    open_subtasks_count = serializers.SerializerMethodField()
     approval_chain = serializers.SerializerMethodField()
     sla = serializers.SerializerMethodField()
     reviews_count = serializers.SerializerMethodField()
@@ -181,6 +193,13 @@ class ReviewQueueTaskSerializer(serializers.ModelSerializer):
             "status",
             "progress",
             "due_date",
+            "is_overdue",
+            "days_overdue",
+            "working_days_overdue",
+            "due_status",
+            "is_dependency_blocked",
+            "blocking_prerequisites_count",
+            "open_subtasks_count",
             "approval_required",
             "task_owner",
             "task_owner_name",
@@ -234,5 +253,53 @@ class ReviewQueueTaskSerializer(serializers.ModelSerializer):
         reviews = sorted(obj.reviews.all(), key=lambda r: (r.review_round, r.reviewed_at), reverse=True)
         return TaskReviewSerializer(reviews, many=True, context={"omit_chain": True}).data
 
+    def _schedule_metrics(self, obj):
+        if not hasattr(obj, "_cached_sched_metrics"):
+            cal_cache = self.context.setdefault("_company_calendar_cache", {})
+            comp = getattr(getattr(obj, "project", None), "company", None)
+            cid = getattr(comp, "id", None)
+            if cid not in cal_cache:
+                cal_cache[cid] = get_company_working_calendar(comp)
+            obj._cached_sched_metrics = compute_task_schedule_metrics(
+                obj, calendar_cfg=cal_cache[cid]
+            )
+        return obj._cached_sched_metrics
+
+    def _dep_eval(self, obj):
+        if not hasattr(obj, "_cached_dep_eval"):
+            obj._cached_dep_eval = evaluate_task_dependencies(obj)
+        return obj._cached_dep_eval
+
+    def get_is_overdue(self, obj):
+        return self._schedule_metrics(obj)["is_overdue"]
+
+    def get_days_overdue(self, obj):
+        return self._schedule_metrics(obj)["days_overdue"]
+
+    def get_working_days_overdue(self, obj):
+        return self._schedule_metrics(obj)["working_days_overdue"]
+
+    def get_due_status(self, obj):
+        return self._schedule_metrics(obj)["due_status"]
+
+    def get_is_dependency_blocked(self, obj):
+        return self._dep_eval(obj)["is_dependency_blocked"]
+
+    def get_blocking_prerequisites_count(self, obj):
+        return self._dep_eval(obj)["blocking_prerequisites_count"]
+
+    def get_open_subtasks_count(self, obj):
+        return sum(
+            1
+            for st in obj.subtasks.all()
+            if st.status not in (Task.Status.COMPLETED, Task.Status.CANCELLED)
+        )
+
     def get_allowed_transitions(self, obj):
-        return get_allowed_next_statuses(task=obj)
+        request = self.context.get("request")
+        actor = (
+            request.user
+            if request and getattr(request, "user", None) and request.user.is_authenticated
+            else None
+        )
+        return get_allowed_next_statuses(task=obj, actor=actor)
