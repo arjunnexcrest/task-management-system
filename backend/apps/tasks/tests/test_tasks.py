@@ -518,4 +518,163 @@ class APIStructureAndSerializersTestCase(APITestCase):
             ).exists()
         )
 
+    def test_task_status_workflow_and_validation(self):
+        """
+        Tests SRS §7.3, §8.3, §12.2, §14.3, §20.2, §22 (#3, #5, #7, #9) & DB Design §4.7:
+        1. Task without responsible owner/assignee cannot move to In Progress
+        2. Invalid workflow transitions (e.g. Backlog -> Completed, To Do -> Approved) are rejected
+        3. Approval-required task cannot bypass In Review / Approved to Completed
+        4. Open subtask blocks Completed unless override_subtasks=True with override_reason
+        5. PATCH /api/tasks/{id}/ enforces the same workflow transition rules
+        6. Correction flow: In Review -> Changes Requested -> In Progress -> In Review -> Approved -> Completed
+        7. DB-configured WorkflowTransition overrides default transitions when present
+        """
+        from apps.system_settings.models import WorkflowStatus, WorkflowTransition
+
+        self.client.force_authenticate(user=self.user_a)
+
+        # Task with no owner yet in Backlog
+        task = Task.objects.create(
+            project=self.project_a,
+            title="Workflow Guarded Task",
+            created_by=self.user_a,
+            status=Task.Status.BACKLOG,
+            approval_required=True,
+        )
+
+        # 1. Invalid jump Backlog -> Completed rejected
+        r_bad_jump = self.client.post(
+            f"/api/tasks/{task.id}/transition-status/",
+            {"status": "Completed"},
+            format="json",
+        )
+        self.assertEqual(r_bad_jump.status_code, 400)
+
+        # 2. Moving to In Progress without owner/assignee rejected (SRS §22 #3)
+        r_no_owner = self.client.post(
+            f"/api/tasks/{task.id}/transition-status/",
+            {"status": "In Progress"},
+            format="json",
+        )
+        self.assertEqual(r_no_owner.status_code, 400)
+
+        # Assign owner & move Backlog -> To Do -> In Progress
+        task.task_owner = self.user_a
+        task.save(update_fields=["task_owner"])
+
+        r_todo = self.client.post(
+            f"/api/tasks/{task.id}/transition-status/",
+            {"status": "To Do"},
+            format="json",
+        )
+        self.assertEqual(r_todo.status_code, 200)
+
+        # PATCH /api/tasks/{id}/ also rejects invalid transition To Do -> Approved
+        r_patch_bad = self.client.patch(
+            f"/api/tasks/{task.id}/",
+            {"status": "Approved"},
+            format="json",
+        )
+        self.assertEqual(r_patch_bad.status_code, 400)
+
+        r_prog = self.client.post(
+            f"/api/tasks/{task.id}/transition-status/",
+            {"status": "In Progress", "reason": "Starting implementation"},
+            format="json",
+        )
+        self.assertEqual(r_prog.status_code, 200)
+
+        # 3. Approval-required task cannot skip In Review/Approved to Completed
+        r_skip_review = self.client.post(
+            f"/api/tasks/{task.id}/transition-status/",
+            {"status": "Completed"},
+            format="json",
+        )
+        self.assertEqual(r_skip_review.status_code, 400)
+        self.assertNotIn("Completed", r_prog.data["allowed_transitions"])
+
+        # 4. Correction loop: In Progress -> In Review -> Changes Requested -> In Progress -> In Review -> Approved
+        for st in ("In Review", "Changes Requested", "In Progress", "In Review", "Approved"):
+            res = self.client.post(
+                f"/api/tasks/{task.id}/transition-status/",
+                {"status": st},
+                format="json",
+            )
+            self.assertEqual(res.status_code, 200, res.content)
+
+        # 5. Open subtask blocks Completed unless override_subtasks + override_reason provided
+        sub = Task.objects.create(
+            project=self.project_a,
+            parent_task=task,
+            title="Mandatory Subtask",
+            created_by=self.user_a,
+            status=Task.Status.IN_PROGRESS,
+        )
+        r_open_sub = self.client.post(
+            f"/api/tasks/{task.id}/transition-status/",
+            {"status": "Completed"},
+            format="json",
+        )
+        self.assertEqual(r_open_sub.status_code, 400)
+
+        # Override without reason -> 400
+        r_override_no_reason = self.client.post(
+            f"/api/tasks/{task.id}/transition-status/",
+            {"status": "Completed", "override_subtasks": True},
+            format="json",
+        )
+        self.assertEqual(r_override_no_reason.status_code, 400)
+
+        # Override with reason -> 200
+        r_override_ok = self.client.post(
+            f"/api/tasks/{task.id}/transition-status/",
+            {
+                "status": "Completed",
+                "override_subtasks": True,
+                "override_reason": "Subtask deferred to Phase 2",
+            },
+            format="json",
+        )
+        self.assertEqual(r_override_ok.status_code, 200, r_override_ok.content)
+        self.assertEqual(r_override_ok.data["status"], "Completed")
+        self.assertTrue(
+            TaskComment.objects.filter(
+                task=task, content__icontains="Subtask deferred to Phase 2"
+            ).exists()
+        )
+
+        # 6. DB-configured WorkflowTransition overrides default transitions
+        ws_todo = WorkflowStatus.objects.create(
+            company=self.company_a,
+            entity_type="Task",
+            status_code="To Do",
+            display_name="To Do",
+            sort_order=1,
+        )
+        ws_hold = WorkflowStatus.objects.create(
+            company=self.company_a,
+            entity_type="Task",
+            status_code="On Hold",
+            display_name="On Hold",
+            sort_order=2,
+        )
+        WorkflowTransition.objects.create(
+            company=self.company_a,
+            entity_type="Task",
+            from_status=ws_todo,
+            to_status=ws_hold,
+        )
+        t_cfg = Task.objects.create(
+            project=self.project_a,
+            title="Configured Workflow Task",
+            created_by=self.user_a,
+            task_owner=self.user_a,
+            status=Task.Status.TO_DO,
+        )
+        allowed_res = self.client.get(f"/api/tasks/{t_cfg.id}/allowed-transitions/")
+        self.assertEqual(allowed_res.status_code, 200)
+        self.assertEqual(allowed_res.data["allowed_transitions"], ["On Hold"])
+        sub.delete()
+
+
 

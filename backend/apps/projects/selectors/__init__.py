@@ -23,6 +23,7 @@ def get_project_list_queryset(request=None):
                 distinct=True,
             ),
         )
+        .order_by("-created_at")
     )
     return scope_queryset_by_company(qs, request, company_lookup="company_id")
 

@@ -13,11 +13,11 @@ class CompanyViewSet(viewsets.ModelViewSet):
     """
     Company CRUD at /api/companies/
     - Only the CEO can create, view, update, and delete companies (other roles get 403; unauthenticated gets 401).
-    - DELETE performs a soft delete (is_active=False), never removing the row.
+    - DELETE performs a soft delete (is_active=False, status='Inactive'), never removing the row.
     - Supports search by name and pagination.
     """
 
-    queryset = Company.objects.all().order_by("name")
+    queryset = Company.objects.prefetch_related("memberships").all().order_by("name")
     serializer_class = CompanySerializer
     permission_classes = [IsAuthenticated, IsCEO]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]

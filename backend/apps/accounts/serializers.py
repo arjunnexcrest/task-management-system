@@ -7,7 +7,7 @@ from django.db.models import Q
 from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from rest_framework import serializers
-from rest_framework.exceptions import AuthenticationFailed
+from rest_framework.exceptions import AuthenticationFailed, PermissionDenied
 from rest_framework.views import exception_handler
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.serializers import (
@@ -16,6 +16,12 @@ from rest_framework_simplejwt.serializers import (
 )
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from apps.common.permissions import (
+    get_ordered_user_roles,
+    get_primary_role,
+    get_user_capabilities,
+    is_ceo,
+)
 from .models import User
 
 
@@ -90,12 +96,10 @@ class CustomTokenRefreshSerializer(TokenRefreshSerializer):
 
 
 def _get_user_org_summary(obj: User) -> dict:
-    roles: list[str] = []
     company_ids: list[str] = []
     memberships: list[dict] = []
     primary_company = None
     primary_company_name = None
-    primary_role = "CEO" if obj.is_superuser else "Employee"
     department_names: list[str] = []
     team_names: list[str] = []
     reporting_managers: list[dict] = []
@@ -103,7 +107,11 @@ def _get_user_org_summary(obj: User) -> dict:
 
     try:
         from apps.companies.models import CompanyMembership
-        from apps.organization.models import DepartmentMembership, ReportingRelationship, TeamMembership
+        from apps.organization.models import (
+            DepartmentMembership,
+            ReportingRelationship,
+            TeamMembership,
+        )
 
         active_memberships = list(
             CompanyMembership.objects.filter(
@@ -112,20 +120,24 @@ def _get_user_org_summary(obj: User) -> dict:
                 status=CompanyMembership.Status.ACTIVE,
             )
             .select_related("company")
+            .prefetch_related("membership_roles__role")
             .order_by("joined_at")
         )
 
         for m in active_memberships:
             company_ids.append(str(m.company_id))
-            if m.role and m.role not in roles:
-                roles.append(m.role)
+            role_val = m.role
+            if not role_val or role_val == User.RoleChoices.EMPLOYEE:
+                mr = next(iter(m.membership_roles.all()), None)
+                if mr and mr.role and mr.role.code:
+                    role_val = mr.role.code
             memberships.append(
                 {
                     "id": str(m.id),
                     "company": str(m.company_id),
                     "company_name": m.company.name,
                     "company_code": m.company.code,
-                    "role": m.role,
+                    "role": role_val,
                     "is_active": m.is_active,
                     "joined_at": m.joined_at.isoformat() if m.joined_at else None,
                 }
@@ -134,7 +146,6 @@ def _get_user_org_summary(obj: User) -> dict:
         if active_memberships:
             primary_company = str(active_memberships[0].company_id)
             primary_company_name = active_memberships[0].company.name
-            primary_role = active_memberships[0].role
 
         department_names = list(
             DepartmentMembership.objects.filter(
@@ -177,8 +188,9 @@ def _get_user_org_summary(obj: User) -> dict:
     except Exception:
         pass
 
-    if not roles:
-        roles = [primary_role]
+    roles = get_ordered_user_roles(obj)
+    primary_role = get_primary_role(obj)
+    capabilities = get_user_capabilities(obj)
 
     return {
         "memberships": memberships,
@@ -186,6 +198,7 @@ def _get_user_org_summary(obj: User) -> dict:
         "primary_company_name": primary_company_name,
         "primary_role": primary_role,
         "roles": roles,
+        "capabilities": capabilities,
         "company_ids": company_ids,
         "department_names": department_names,
         "team_names": team_names,
@@ -200,6 +213,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
     role = serializers.SerializerMethodField()
     memberships = serializers.SerializerMethodField()
     roles = serializers.SerializerMethodField()
+    capabilities = serializers.SerializerMethodField()
     company_ids = serializers.SerializerMethodField()
     department_names = serializers.SerializerMethodField()
     team_names = serializers.SerializerMethodField()
@@ -226,6 +240,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
             "is_staff",
             "is_superuser",
             "roles",
+            "capabilities",
             "company_ids",
             "department_names",
             "team_names",
@@ -258,6 +273,9 @@ class UserProfileSerializer(serializers.ModelSerializer):
 
     def get_roles(self, obj: User) -> list[str]:
         return self._ctx(obj)["roles"]
+
+    def get_capabilities(self, obj: User) -> dict[str, bool]:
+        return self._ctx(obj)["capabilities"]
 
     def get_company_ids(self, obj: User) -> list[str]:
         return self._ctx(obj)["company_ids"]
@@ -427,8 +445,13 @@ class UpdateMeSerializer(serializers.ModelSerializer):
         return instance
 
 
+MeUpdateSerializer = UpdateMeSerializer
+
+
 class LoginSerializer(serializers.Serializer):
-    identifier = serializers.CharField(write_only=True)
+    identifier = serializers.CharField(write_only=True, required=False, allow_blank=False)
+    email = serializers.CharField(write_only=True, required=False, allow_blank=False)
+    username = serializers.CharField(write_only=True, required=False, allow_blank=False)
     password = serializers.CharField(
         write_only=True,
         trim_whitespace=False,
@@ -436,7 +459,14 @@ class LoginSerializer(serializers.Serializer):
     )
 
     def validate(self, attrs):
-        identifier = attrs["identifier"].strip()
+        identifier = (
+            attrs.get("identifier")
+            or attrs.get("email")
+            or attrs.get("username")
+            or ""
+        ).strip()
+        if not identifier:
+            raise serializers.ValidationError({"identifier": "Email or username is required."})
         password = attrs["password"]
 
         db_user = User.objects.filter(
@@ -444,8 +474,8 @@ class LoginSerializer(serializers.Serializer):
         ).first()
 
         if db_user is not None and db_user.is_locked:
-            raise serializers.ValidationError(
-                {"detail": "Account is temporarily locked due to multiple failed login attempts. Please try again in 15 minutes."},
+            raise PermissionDenied(
+                "Account is temporarily locked due to multiple failed login attempts. Please try again in 15 minutes.",
                 code="account_locked",
             )
 
@@ -459,19 +489,16 @@ class LoginSerializer(serializers.Serializer):
             if db_user is not None:
                 db_user.record_failed_login()
                 if db_user.is_locked:
-                    raise serializers.ValidationError(
-                        {"detail": "Account is temporarily locked due to multiple failed login attempts. Please try again in 15 minutes."},
+                    raise PermissionDenied(
+                        "Account is temporarily locked due to multiple failed login attempts. Please try again in 15 minutes.",
                         code="account_locked",
                     )
 
-            raise serializers.ValidationError(
-                {"detail": "Invalid credentials"},
-                code="invalid_credentials",
-            )
+            raise AuthenticationFailed("Invalid credentials", code="invalid_credentials")
 
         if not user.is_active or user.account_status != User.AccountStatus.ACTIVE:
-            raise serializers.ValidationError(
-                {"detail": "Your account is not active. Please contact your administrator."},
+            raise PermissionDenied(
+                "Your account is not active. Please contact your administrator.",
                 code="account_inactive",
             )
 
@@ -481,13 +508,15 @@ class LoginSerializer(serializers.Serializer):
 
 
 class LogoutSerializer(serializers.Serializer):
-    refresh = serializers.CharField(write_only=True)
+    refresh = serializers.CharField(write_only=True, required=False, allow_blank=True)
 
     def validate(self, attrs):
-        self.token = attrs["refresh"]
+        self.token = attrs.get("refresh") or ""
         return attrs
 
     def save(self, **kwargs):
+        if not self.token:
+            return
         try:
             token = RefreshToken(self.token)
             token.blacklist()
@@ -690,8 +719,8 @@ class RegisterEmployeeSerializer(serializers.ModelSerializer):
 class UserSerializer(serializers.ModelSerializer):
     """
     Per DB Design §7 Rule #9: 'Do not expose password hashes or unrestricted storage keys through serializers.'
-    Company and role are stored on CompanyMembership; optional write-only `company` & `role`
-    fields are accepted on create/update for seamless compatibility with /api/users/.
+    Company and role are stored on CompanyMembership (and synced with RBAC MembershipRole);
+    optional write-only `company` & `role` fields are accepted on create/update.
     """
 
     username = serializers.CharField(max_length=150, required=False, allow_blank=True)
@@ -703,6 +732,7 @@ class UserSerializer(serializers.ModelSerializer):
     company_name = serializers.SerializerMethodField()
     memberships = serializers.SerializerMethodField()
     roles = serializers.SerializerMethodField()
+    capabilities = serializers.SerializerMethodField()
     company_ids = serializers.SerializerMethodField()
     department_names = serializers.SerializerMethodField()
     team_names = serializers.SerializerMethodField()
@@ -732,6 +762,7 @@ class UserSerializer(serializers.ModelSerializer):
             "failed_login_attempts",
             "locked_until",
             "roles",
+            "capabilities",
             "company_ids",
             "department_names",
             "team_names",
@@ -750,6 +781,7 @@ class UserSerializer(serializers.ModelSerializer):
             "failed_login_attempts",
             "locked_until",
             "roles",
+            "capabilities",
             "company_ids",
             "department_names",
             "team_names",
@@ -782,6 +814,9 @@ class UserSerializer(serializers.ModelSerializer):
 
     def get_roles(self, obj: User) -> list[str]:
         return self._ctx(obj)["roles"]
+
+    def get_capabilities(self, obj: User) -> dict[str, bool]:
+        return self._ctx(obj)["capabilities"]
 
     def get_company_ids(self, obj: User) -> list[str]:
         return self._ctx(obj)["company_ids"]
@@ -816,10 +851,27 @@ class UserSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError("A user with this username already exists.")
         return value.strip() if value else ""
 
+    def _sync_rbac_role(self, membership, role_code):
+        if not membership or not role_code:
+            return
+        try:
+            from apps.rbac.models import MembershipRole, Role
+
+            role_obj, _ = Role.objects.get_or_create(
+                code=role_code,
+                defaults={"name": membership.get_role_display(), "is_system_role": True},
+            )
+            MembershipRole.objects.filter(membership=membership).exclude(role=role_obj).delete()
+            MembershipRole.objects.get_or_create(membership=membership, role=role_obj)
+        except Exception:
+            pass
+
     def _upsert_membership(self, user: User, company_id=None, role=None):
         if not company_id and not role:
             return
         from apps.companies.models import Company, CompanyMembership
+
+        membership = None
         if company_id:
             if not Company.objects.filter(pk=company_id).exists():
                 raise serializers.ValidationError({"company": "Company does not exist."})
@@ -841,6 +893,7 @@ class UserSerializer(serializers.ModelSerializer):
                     changed = True
                 if changed:
                     membership.save()
+            self._sync_rbac_role(membership, membership.role)
         elif role:
             membership = (
                 CompanyMembership.objects.filter(user=user, is_active=True)
@@ -850,6 +903,12 @@ class UserSerializer(serializers.ModelSerializer):
             if membership:
                 membership.role = role
                 membership.save()
+                self._sync_rbac_role(membership, membership.role)
+
+        if hasattr(user, "_org_summary_cache"):
+            delattr(user, "_org_summary_cache")
+        if hasattr(user, "_cached_rbac_role_codes"):
+            delattr(user, "_cached_rbac_role_codes")
 
     def create(self, validated_data):
         password = validated_data.pop("password", None)
@@ -873,9 +932,6 @@ class UserSerializer(serializers.ModelSerializer):
         return user
 
     def update(self, instance, validated_data):
-        from rest_framework.exceptions import PermissionDenied
-        from apps.common.permissions import is_ceo
-
         request = self.context.get("request")
         company_id = validated_data.pop("company", None)
         role = validated_data.pop("role", None)
@@ -892,6 +948,4 @@ class UserSerializer(serializers.ModelSerializer):
             instance.set_password(password)
         instance.save()
         self._upsert_membership(instance, company_id=company_id, role=role)
-        if hasattr(instance, "_org_summary_cache"):
-            delattr(instance, "_org_summary_cache")
         return instance

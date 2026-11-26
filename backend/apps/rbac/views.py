@@ -1,6 +1,6 @@
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import viewsets
-from apps.common.permissions import IsCompanyMemberOrAllowAnyInDev
+from apps.common.permissions import RBACAndSettingsPermission
 from apps.common.selectors import scope_queryset_by_company
 from .models import MembershipRole, Permission, Role, RolePermission
 from .serializers import (
@@ -14,7 +14,7 @@ from .serializers import (
 class RoleViewSet(viewsets.ModelViewSet):
     queryset = Role.objects.prefetch_related("role_permissions__permission").all()
     serializer_class = RoleSerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [RBACAndSettingsPermission]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ["is_system_role", "code"]
 
@@ -22,12 +22,12 @@ class RoleViewSet(viewsets.ModelViewSet):
 class PermissionViewSet(viewsets.ModelViewSet):
     queryset = Permission.objects.all()
     serializer_class = PermissionSerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [RBACAndSettingsPermission]
 
 
 class MembershipRoleViewSet(viewsets.ModelViewSet):
     serializer_class = MembershipRoleSerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [RBACAndSettingsPermission]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ["membership", "role"]
 
@@ -41,6 +41,6 @@ class MembershipRoleViewSet(viewsets.ModelViewSet):
 class RolePermissionViewSet(viewsets.ModelViewSet):
     queryset = RolePermission.objects.select_related("role", "permission").all()
     serializer_class = RolePermissionSerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [RBACAndSettingsPermission]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ["role", "permission"]
