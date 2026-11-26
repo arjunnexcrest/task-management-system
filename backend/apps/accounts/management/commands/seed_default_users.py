@@ -165,7 +165,11 @@ class Command(BaseCommand):
             membership, _ = CompanyMembership.objects.update_or_create(
                 company=company,
                 user=user,
-                defaults={"status": CompanyMembership.Status.ACTIVE},
+                defaults={
+                    "role": spec["role_code"],
+                    "is_active": True,
+                    "status": CompanyMembership.Status.ACTIVE,
+                },
             )
             MembershipRole.objects.get_or_create(
                 membership=membership,

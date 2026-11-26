@@ -1,50 +1,88 @@
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters, status, viewsets
+from rest_framework.decorators import action
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from apps.common.permissions import (
-    CompanyManagementPermission,
-    UserManagementPermission,
-)
-from apps.common.selectors import scope_queryset_by_company
 from .models import Company, CompanyMembership
+from .permissions import IsCEO, IsCompanyMember, get_user_company_ids, is_ceo
 from .serializers import CompanyMembershipSerializer, CompanySerializer
 
 
 class CompanyViewSet(viewsets.ModelViewSet):
+    """
+    Company CRUD at /api/companies/
+    - Only the CEO can create, view, update, and delete companies (other roles get 403; unauthenticated gets 401).
+    - DELETE performs a soft delete (is_active=False, status='Inactive'), never removing the row.
+    - Supports search by name and pagination.
+    """
+
+    queryset = Company.objects.prefetch_related("memberships").all().order_by("name")
     serializer_class = CompanySerializer
-    permission_classes = [CompanyManagementPermission]
+    permission_classes = [IsAuthenticated, IsCEO]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ["status", "code"]
-    search_fields = ["name", "code", "address"]
+    filterset_fields = ["is_active", "status", "code"]
+    search_fields = ["name", "code", "email", "phone", "address"]
     ordering_fields = ["name", "code", "created_at"]
 
-    def get_queryset(self):
-        qs = Company.objects.prefetch_related("memberships").all()
-        qs = scope_queryset_by_company(qs, self.request, company_lookup="id")
-        is_active_param = self.request.query_params.get("is_active")
-        if is_active_param is not None and is_active_param != "":
-            flag = str(is_active_param).lower() in ("true", "1", "yes")
-            if flag:
-                qs = qs.filter(status=Company.Status.ACTIVE)
-            else:
-                qs = qs.exclude(status=Company.Status.ACTIVE)
-        return qs
-
-    def destroy(self, request, *args, **kwargs):
-        """Soft-deactivate company to preserve historical projects, tasks, and memberships (DB Design §5)."""
-        company = self.get_object()
-        company.status = Company.Status.INACTIVE
-        company.save(update_fields=["status", "updated_at"])
-        return Response(status=status.HTTP_204_NO_CONTENT)
+    def perform_destroy(self, instance: Company):
+        instance.soft_delete()
 
 
 class CompanyMembershipViewSet(viewsets.ModelViewSet):
+    """
+    Company Membership APIs at /api/memberships/ (and /api/companies/memberships/):
+    - CEO can add a user to a company with a role, change role, activate, and deactivate.
+    - Non-CEO users can only view memberships in their own active companies (non-members get 403).
+    - DELETE soft-deactivates the membership (is_active=False).
+    """
+
     serializer_class = CompanyMembershipSerializer
-    permission_classes = [UserManagementPermission]
-    filter_backends = [DjangoFilterBackend]
-    filterset_fields = ["company", "user", "status"]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ["company", "user", "role", "is_active", "status"]
+    search_fields = ["user__full_name", "user__email", "company__name", "role"]
+    ordering_fields = ["joined_at", "role"]
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [IsAuthenticated(), IsCompanyMember()]
+        return [IsAuthenticated(), IsCEO()]
 
     def get_queryset(self):
-        qs = CompanyMembership.objects.select_related("company", "user").all()
-        return scope_queryset_by_company(qs, self.request, company_lookup="company_id")
+        qs = CompanyMembership.objects.select_related("company", "user").all().order_by("-joined_at")
+        user = self.request.user
+        if is_ceo(user):
+            return qs
+        cids = get_user_company_ids(user)
+        if not cids:
+            return qs.none()
+        return qs.filter(company_id__in=cids)
+
+    def perform_destroy(self, instance: CompanyMembership):
+        instance.deactivate()
+
+    @action(detail=True, methods=["post"], url_path="deactivate")
+    def deactivate_membership(self, request, pk=None):
+        """POST /api/memberships/<id>/deactivate/ — Deactivate membership."""
+        membership = self.get_object()
+        membership.deactivate()
+        return Response(
+            {
+                "detail": "Membership deactivated.",
+                "membership": CompanyMembershipSerializer(membership, context={"request": request}).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["post"], url_path="activate")
+    def activate_membership(self, request, pk=None):
+        """POST /api/memberships/<id>/activate/ — Reactivate membership."""
+        membership = self.get_object()
+        membership.activate()
+        return Response(
+            {
+                "detail": "Membership activated.",
+                "membership": CompanyMembershipSerializer(membership, context={"request": request}).data,
+            },
+            status=status.HTTP_200_OK,
+        )
