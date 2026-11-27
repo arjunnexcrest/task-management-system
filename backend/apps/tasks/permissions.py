@@ -3,7 +3,7 @@ tasks/permissions.py
 
 Role-based & multi-company permissions for Task management operations (SRS §2.1–§2.6, §7 & PERM-05):
 - Management roles (CEO, CompanyInCharge, ProjectManager, DepartmentHead, TeamLeader) or the
-  accountable project.project_manager can delete tasks, assign/reassign/bulk-assign tasks,
+  accountable project.project_manager can create/delete tasks, assign/reassign/bulk-assign tasks,
   reschedule tasks, and manage task dependencies.
 - Regular Employees can execute assigned tasks (update status/progress, create subtasks,
   toggle checklists, post comments, upload attachments, log time, acknowledge assignments),
@@ -13,6 +13,9 @@ from rest_framework import permissions
 
 from apps.common.permissions import (
     MANAGEMENT_ROLES,
+    TaskAssignmentPermission,
+    TaskDependencyPermission,
+    TaskManagementPermission,
     get_company_id_from_request,
     is_ceo,
     is_user_active,
@@ -125,3 +128,13 @@ class CanManageTasks(permissions.BasePermission):
             return user_has_any_role(user, MANAGEMENT_ROLES)
         project = _resolve_project_from_obj(obj)
         return user_is_project_manager_or_management(user, project)
+
+
+__all__ = [
+    "CanManageTasks",
+    "TaskManagementPermission",
+    "TaskAssignmentPermission",
+    "TaskDependencyPermission",
+    "user_is_project_manager_or_management",
+    "user_is_task_manager",
+]

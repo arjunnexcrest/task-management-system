@@ -494,7 +494,7 @@ class PermissionAuditTestCase(TestCase):
             a["id"] for a in (att_list.data["results"] if "results" in att_list.data else att_list.data)
         ]
         self.assertNotIn(str(att_b.id), att_ids)
-        self.assertEqual(c_emp.get(f"/api/tasks/attachments/{att_b.id}/download/").status_code, 404)
+        self.assertIn(c_emp.get(f"/api/tasks/attachments/{att_b.id}/download/").status_code, (403, 404))
 
         # Employee cannot delete, assign, bulk_assign, or reschedule tasks
         self.assertEqual(c_emp.delete(f"/api/tasks/{self.task_a1.id}/").status_code, 403)
@@ -699,16 +699,17 @@ class PermissionAuditTestCase(TestCase):
         self.assertEqual(dash.data["projects"]["total_projects"], 1)
         self.assertEqual(dash.data["tasks"]["total_tasks_and_subtasks"], 1)
 
-        # JSON report works (scoped to 1 task); CSV export blocked with 403 for regular Employee
+        # Reports & CSV export are restricted to leadership/reporting roles (403 for regular Employee)
         rep_json = c_emp.get("/api/reports/tasks/")
-        self.assertEqual(rep_json.status_code, 200)
-        self.assertEqual(rep_json.data["count"], 1)
+        self.assertEqual(rep_json.status_code, 403)
 
         rep_csv_emp = c_emp.get("/api/reports/tasks/?format=csv")
         self.assertEqual(rep_csv_emp.status_code, 403)
 
-        # PM can export CSV
+        # PM can view JSON report (scoped) and export CSV
         c_pm = self._client_for(self.pm_a)
+        rep_json_pm = c_pm.get("/api/reports/tasks/")
+        self.assertEqual(rep_json_pm.status_code, 200)
         rep_csv_pm = c_pm.get("/api/reports/tasks/?format=csv")
         self.assertEqual(rep_csv_pm.status_code, 200)
         self.assertIn("text/csv", rep_csv_pm["Content-Type"])

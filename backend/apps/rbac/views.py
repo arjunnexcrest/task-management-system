@@ -4,7 +4,7 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from apps.common.permissions import IsCEO, IsCompanyMember
+from apps.common.permissions import IsActiveUser, IsCEO, IsCompanyMember
 from apps.common.selectors import scope_queryset_by_company
 from .models import MembershipRole, Permission, Role, RolePermission
 from .serializers import (
@@ -31,8 +31,8 @@ class RoleViewSet(viewsets.ModelViewSet):
 
     def get_permissions(self):
         if self.action in ("list", "retrieve"):
-            return [IsAuthenticated(), IsCompanyMember()]
-        return [IsAuthenticated(), IsCEO()]
+            return [IsAuthenticated(), IsActiveUser(), IsCompanyMember()]
+        return [IsAuthenticated(), IsActiveUser(), IsCEO()]
 
     def perform_destroy(self, instance: Role):
         if instance.is_system_role:
@@ -51,8 +51,8 @@ class PermissionViewSet(viewsets.ModelViewSet):
 
     def get_permissions(self):
         if self.action in ("list", "retrieve"):
-            return [IsAuthenticated(), IsCompanyMember()]
-        return [IsAuthenticated(), IsCEO()]
+            return [IsAuthenticated(), IsActiveUser(), IsCompanyMember()]
+        return [IsAuthenticated(), IsActiveUser(), IsCEO()]
 
 
 class MembershipRoleViewSet(viewsets.ModelViewSet):
@@ -64,8 +64,8 @@ class MembershipRoleViewSet(viewsets.ModelViewSet):
 
     def get_permissions(self):
         if self.action in ("list", "retrieve"):
-            return [IsAuthenticated(), IsCompanyMember()]
-        return [IsAuthenticated(), IsCEO()]
+            return [IsAuthenticated(), IsActiveUser(), IsCompanyMember()]
+        return [IsAuthenticated(), IsActiveUser(), IsCEO()]
 
     def get_queryset(self):
         qs = (
@@ -91,5 +91,5 @@ class RolePermissionViewSet(viewsets.ModelViewSet):
 
     def get_permissions(self):
         if self.action in ("list", "retrieve"):
-            return [IsAuthenticated(), IsCompanyMember()]
-        return [IsAuthenticated(), IsCEO()]
+            return [IsAuthenticated(), IsActiveUser(), IsCompanyMember()]
+        return [IsAuthenticated(), IsActiveUser(), IsCEO()]

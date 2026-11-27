@@ -862,13 +862,14 @@ def delete_project_service(*, project: Project, force: bool = True) -> None:
     If the project has tasks and force=False, raises ValidationError advising archival.
     When force=True (default for DELETE /api/projects/{id}/), cleans up protected child task records first.
     """
+    from apps.risks.models import Blocker, Issue, Risk
+
     if project.tasks.exists():
         if not force:
             raise ValidationError(
                 "Project has historical tasks. Pass ?force=true to delete or use the archive endpoint to preserve history."
             )
         from apps.reviews.models import TaskReview
-        from apps.risks.models import Blocker
         from apps.tracking.models import ProgressUpdate, TimeEntry
 
         task_ids = list(project.tasks.values_list("id", flat=True))
@@ -876,21 +877,177 @@ def delete_project_service(*, project: Project, force: bool = True) -> None:
         TimeEntry.objects.filter(task_id__in=task_ids).delete()
         TaskReview.objects.filter(task_id__in=task_ids).delete()
         Blocker.objects.filter(task_id__in=task_ids).delete()
+        Issue.objects.filter(project=project).delete()
+        Risk.objects.filter(project=project).delete()
         project.tasks.filter(parent_task__isnull=False).delete()
         project.tasks.all().delete()
+    else:
+        Issue.objects.filter(project=project).delete()
+        Risk.objects.filter(project=project).delete()
 
     project.delete()
 
 
 @transaction.atomic
+def recalculate_milestone_progress_service(*, milestone) -> object:
+    """
+    SRS §6.4 & DB Design §4.3:
+    Recalculates a ProjectMilestone's completion progress and status from its linked
+    MilestoneTask records while respecting prerequisite MilestoneDependencies and approval flags.
+    """
+    from decimal import Decimal
+    from apps.projects.models import ProjectMilestone
+
+    today = timezone.now().date()
+    linked = [
+        mt.task
+        for mt in milestone.milestone_tasks.select_related("task").all()
+        if mt.task and mt.task.status != "Cancelled"
+    ]
+    if not linked:
+        return milestone
+
+    m_avg = round(sum(float(t.progress) for t in linked) / len(linked), 2)
+    new_prog = Decimal(f"{m_avg:.2f}")
+    all_done = all(t.status == "Completed" for t in linked)
+    has_unmet_prereqs = milestone.dependencies.exclude(
+        depends_on_milestone__status=ProjectMilestone.Status.COMPLETED
+    ).exists()
+
+    update_fields = []
+    if milestone.progress != new_prog:
+        milestone.progress = new_prog
+        update_fields.append("progress")
+
+    new_status = milestone.status
+    if all_done and not has_unmet_prereqs and not milestone.approval_required:
+        new_status = ProjectMilestone.Status.COMPLETED
+    elif milestone.status != ProjectMilestone.Status.COMPLETED:
+        if milestone.target_date and milestone.target_date < today:
+            new_status = ProjectMilestone.Status.DELAYED
+        elif new_prog > Decimal("0.00"):
+            new_status = ProjectMilestone.Status.IN_PROGRESS
+        else:
+            new_status = ProjectMilestone.Status.PENDING
+    elif not all_done:
+        # A linked task was reopened after milestone completion
+        new_status = (
+            ProjectMilestone.Status.DELAYED
+            if (milestone.target_date and milestone.target_date < today)
+            else ProjectMilestone.Status.IN_PROGRESS
+        )
+
+    if new_status != milestone.status:
+        milestone.status = new_status
+        update_fields.append("status")
+
+    if update_fields:
+        milestone.save(update_fields=update_fields)
+    return milestone
+
+
+@transaction.atomic
+def complete_milestone_service(*, milestone, actor=None):
+    """
+    SRS §6.4 & §15:
+    Marks a ProjectMilestone Completed after validating:
+    1. All prerequisite MilestoneDependencies are Completed.
+    2. All linked non-cancelled MilestoneTasks are Completed.
+    Notifies the project manager and milestone owner.
+    """
+    from decimal import Decimal
+    from apps.projects.models import ProjectMilestone
+
+    unmet_prereqs = list(
+        milestone.dependencies.select_related("depends_on_milestone")
+        .exclude(depends_on_milestone__status=ProjectMilestone.Status.COMPLETED)
+    )
+    if unmet_prereqs:
+        names = ", ".join(d.depends_on_milestone.title for d in unmet_prereqs)
+        raise ValidationError(
+            f"Cannot complete milestone '{milestone.title}': prerequisite milestone(s) not yet completed ({names})."
+        )
+
+    incomplete_tasks = list(
+        milestone.milestone_tasks.select_related("task")
+        .exclude(task__status__in=["Completed", "Cancelled"])
+    )
+    if incomplete_tasks:
+        names = ", ".join(mt.task.title for mt in incomplete_tasks[:3])
+        raise ValidationError(
+            f"Cannot complete milestone '{milestone.title}': {len(incomplete_tasks)} linked task(s) are still incomplete ({names})."
+        )
+
+    milestone.status = ProjectMilestone.Status.COMPLETED
+    milestone.progress = Decimal("100.00")
+    milestone.save(update_fields=["status", "progress"])
+
+    notify_users = set()
+    if milestone.project.project_manager_id:
+        notify_users.add(milestone.project.project_manager_id)
+    if milestone.owner_id:
+        notify_users.add(milestone.owner_id)
+    if actor and getattr(actor, "id", None) in notify_users and len(notify_users) > 1:
+        notify_users.discard(actor.id)
+
+    for uid in notify_users:
+        Notification.objects.create(
+            user_id=uid,
+            notification_type="MILESTONE_COMPLETED",
+            title=f"Milestone Completed: {milestone.title}",
+            message=f"Milestone '{milestone.title}' in project '{milestone.project.code}' has been marked Completed.",
+            related_project=milestone.project,
+        )
+    return milestone
+
+
+@transaction.atomic
 def recalculate_project_progress_service(*, project: Project) -> Project:
     """
-    Recalculates overall project completion percentage from top-level non-cancelled tasks (SRS §6.5 & §22 #13).
+    Recalculates overall project completion percentage from top-level non-cancelled tasks
+    (SRS §6.5 & §22 #13), and synchronizes linked phase & milestone progress and status rollups.
     """
-    top_tasks = project.tasks.filter(parent_task__isnull=True).exclude(status="Cancelled")
-    total = top_tasks.count()
+    from decimal import Decimal
+    from apps.projects.models import ProjectPhase
+
+    top_tasks = list(project.tasks.filter(parent_task__isnull=True).exclude(status="Cancelled"))
+    total = len(top_tasks)
     if total > 0:
         avg_progress = sum(float(t.progress) for t in top_tasks) / total
-        project.progress = round(avg_progress, 2)
-        project.save(update_fields=["progress"])
+        project.progress = Decimal(f"{round(avg_progress, 2):.2f}")
+    else:
+        project.progress = Decimal("0.00")
+    project.save(update_fields=["progress"])
+
+    # Roll up progress & status to ProjectPhases that have linked tasks
+    for phase in project.phases.all():
+        phase_tasks = [t for t in top_tasks if t.phase_id == phase.id]
+        if phase_tasks:
+            p_avg = round(sum(float(t.progress) for t in phase_tasks) / len(phase_tasks), 2)
+            new_prog = Decimal(f"{p_avg:.2f}")
+            all_phase_done = all(t.status == "Completed" for t in phase_tasks)
+            if all_phase_done:
+                new_status = ProjectPhase.Status.COMPLETED
+            elif new_prog > Decimal("0.00") or any(
+                t.status in ("In Progress", "In Review", "Approved", "Blocked", "Changes Requested")
+                for t in phase_tasks
+            ):
+                new_status = ProjectPhase.Status.IN_PROGRESS
+            else:
+                new_status = ProjectPhase.Status.NOT_STARTED
+
+            upd = []
+            if phase.progress != new_prog:
+                phase.progress = new_prog
+                upd.append("progress")
+            if phase.status != new_status:
+                phase.status = new_status
+                upd.append("status")
+            if upd:
+                phase.save(update_fields=upd)
+
+    # Roll up progress & status to ProjectMilestones that have linked MilestoneTasks
+    for ms in project.milestones.prefetch_related("milestone_tasks__task", "dependencies__depends_on_milestone").all():
+        recalculate_milestone_progress_service(milestone=ms)
+
     return project

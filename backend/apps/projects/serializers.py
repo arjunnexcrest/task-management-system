@@ -335,6 +335,8 @@ class ProjectTeamSerializer(CompanyScopedValidationMixin, serializers.ModelSeria
 
 class ProjectPhaseSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
     owner_name = serializers.CharField(source="owner.full_name", read_only=True, default=None)
+    tasks_count = serializers.SerializerMethodField()
+    completed_tasks_count = serializers.SerializerMethodField()
 
     class Meta:
         model = ProjectPhase
@@ -348,8 +350,16 @@ class ProjectPhaseSerializer(CompanyScopedValidationMixin, serializers.ModelSeri
             "owner_name",
             "status",
             "progress",
+            "tasks_count",
+            "completed_tasks_count",
         ]
         read_only_fields = ["id"]
+
+    def get_tasks_count(self, obj):
+        return obj.tasks.filter(parent_task__isnull=True).exclude(status="Cancelled").count()
+
+    def get_completed_tasks_count(self, obj):
+        return obj.tasks.filter(parent_task__isnull=True, status="Completed").count()
 
     def validate(self, attrs):
         project = attrs.get("project") or getattr(self.instance, "project", None)
@@ -383,10 +393,21 @@ class MilestoneTaskSerializer(serializers.ModelSerializer):
 
 class MilestoneDependencySerializer(serializers.ModelSerializer):
     depends_on_title = serializers.CharField(source="depends_on_milestone.title", read_only=True)
+    depends_on_status = serializers.CharField(source="depends_on_milestone.status", read_only=True)
+    depends_on_target_date = serializers.DateField(
+        source="depends_on_milestone.target_date", read_only=True
+    )
 
     class Meta:
         model = MilestoneDependency
-        fields = ["id", "milestone", "depends_on_milestone", "depends_on_title"]
+        fields = [
+            "id",
+            "milestone",
+            "depends_on_milestone",
+            "depends_on_title",
+            "depends_on_status",
+            "depends_on_target_date",
+        ]
         read_only_fields = ["id"]
 
     def validate(self, attrs):
@@ -417,6 +438,9 @@ class ProjectMilestoneSerializer(CompanyScopedValidationMixin, serializers.Model
     owner_name = serializers.CharField(source="owner.full_name", read_only=True, default=None)
     milestone_tasks = MilestoneTaskSerializer(many=True, read_only=True)
     dependencies = MilestoneDependencySerializer(many=True, read_only=True)
+    is_overdue = serializers.SerializerMethodField()
+    days_remaining = serializers.SerializerMethodField()
+    is_blocked_by_dependencies = serializers.SerializerMethodField()
 
     class Meta:
         model = ProjectMilestone
@@ -432,16 +456,58 @@ class ProjectMilestoneSerializer(CompanyScopedValidationMixin, serializers.Model
             "status",
             "approval_required",
             "progress",
+            "is_overdue",
+            "days_remaining",
+            "is_blocked_by_dependencies",
             "milestone_tasks",
             "dependencies",
         ]
         read_only_fields = ["id"]
+
+    def get_is_overdue(self, obj):
+        from django.utils import timezone
+
+        if obj.target_date and obj.status not in ("Achieved", "Completed"):
+            return obj.target_date < timezone.now().date()
+        return False
+
+    def get_days_remaining(self, obj):
+        from django.utils import timezone
+
+        if not obj.target_date or obj.status in ("Achieved", "Completed"):
+            return None
+        return (obj.target_date - timezone.now().date()).days
+
+    def get_is_blocked_by_dependencies(self, obj):
+        if obj.status == ProjectMilestone.Status.COMPLETED:
+            return False
+        return obj.dependencies.exclude(
+            depends_on_milestone__status=ProjectMilestone.Status.COMPLETED
+        ).exists()
 
     def validate(self, attrs):
         project = attrs.get("project") or getattr(self.instance, "project", None)
         owner = attrs.get("owner") if "owner" in attrs else getattr(self.instance, "owner", None)
         if project and owner:
             self.validate_user_in_company(owner, project.company, field_label="Milestone owner")
+
+        new_status = attrs.get("status")
+        if (
+            self.instance is not None
+            and new_status == ProjectMilestone.Status.COMPLETED
+            and self.instance.status != ProjectMilestone.Status.COMPLETED
+        ):
+            unmet = list(
+                self.instance.dependencies.select_related("depends_on_milestone")
+                .exclude(depends_on_milestone__status=ProjectMilestone.Status.COMPLETED)
+            )
+            if unmet:
+                names = ", ".join(d.depends_on_milestone.title for d in unmet)
+                raise serializers.ValidationError(
+                    {
+                        "status": f"Cannot mark milestone Completed while prerequisite milestone(s) are incomplete: {names}."
+                    }
+                )
         return attrs
 
 
@@ -805,6 +871,25 @@ class ProjectDetailSerializer(ProjectSerializer):
                 "progress": avg_prog,
             }
 
+        from django.db.models import Sum
+        from apps.risks.models import Blocker, Issue, Risk
+        from apps.tracking.models import TimeEntry
+
+        phases = list(obj.phases.all())
+        milestones = list(obj.milestones.all())
+        total_estimated_effort = round(
+            sum(float(t.estimated_effort or 0) for t in all_tasks), 2
+        )
+        total_logged_mins = (
+            TimeEntry.objects.filter(task__project=obj).aggregate(total=Sum("duration_minutes"))["total"]
+            or 0
+        )
+        open_blockers = Blocker.objects.filter(
+            task__project=obj, resolution_status__in=["Open", "In Progress"]
+        ).count()
+        open_risks = Risk.objects.filter(project=obj).exclude(status="Closed").count()
+        open_issues = Issue.objects.filter(project=obj).exclude(status="Closed").count()
+
         return {
             "total_tasks": total_tasks,
             "completed_tasks": completed_tasks,
@@ -812,6 +897,20 @@ class ProjectDetailSerializer(ProjectSerializer):
             "pending_tasks": pending_tasks,
             "blocked_tasks": blocked_tasks,
             "overdue_tasks": overdue_tasks,
+            "total_estimated_effort": total_estimated_effort,
+            "total_actual_effort_hours": round(total_logged_mins / 60.0, 2),
+            "phases_total": len(phases),
+            "phases_completed": sum(1 for ph in phases if ph.status == "Completed"),
+            "milestones_total": len(milestones),
+            "milestones_completed": sum(1 for ms in milestones if ms.status == "Completed"),
+            "milestones_overdue": sum(
+                1
+                for ms in milestones
+                if ms.target_date and ms.target_date < today and ms.status != "Completed"
+            ),
+            "open_blockers_count": open_blockers,
+            "open_risks_count": open_risks,
+            "open_issues_count": open_issues,
             "department_progress": list(dept_map.values()),
             "team_progress": list(team_map.values()),
         }

@@ -14,6 +14,9 @@ Role-based & multi-company permissions for Project CRUD, Planning, and Assignmen
 from rest_framework import permissions
 
 from apps.common.permissions import (
+    ProjectManagementPermission,
+    ProjectParticipationWritePermission,
+    ProjectPlanningWritePermission,
     get_active_membership,
     get_company_id_from_request,
     get_user_roles_in_company,
@@ -209,3 +212,11 @@ class CanManageProjects(permissions.BasePermission):
             return True
         project = _resolve_project_from_obj(obj)
         return self._can_act_on_project(request, view, project)
+
+
+__all__ = [
+    "CanManageProjects",
+    "ProjectManagementPermission",
+    "ProjectParticipationWritePermission",
+    "ProjectPlanningWritePermission",
+]

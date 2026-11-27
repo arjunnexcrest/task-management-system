@@ -146,30 +146,61 @@ class Task(models.Model):
                 raise ValidationError("Parent task and subtask must belong to the same project.")
 
     def recalculate_auto_progress(self):
+        from decimal import Decimal
+
         if self.progress_method == self.ProgressMethod.SUBTASKS:
-            children = self.subtasks.exclude(status=self.Status.CANCELLED)
-            total = children.count()
-            if total > 0:
-                avg_progress = sum(float(c.progress) for c in children) / total
-                self.progress = round(avg_progress, 2)
-                self.save(update_fields=["progress", "updated_at"])
+            children = list(self.subtasks.exclude(status=self.Status.CANCELLED))
+            if children:
+                # SRS §7.6: Weighted subtasks (using estimated_effort when configured, else equal weight 1.0)
+                weights = [
+                    float(c.estimated_effort)
+                    if (c.estimated_effort is not None and float(c.estimated_effort) > 0)
+                    else 1.0
+                    for c in children
+                ]
+                total_weight = sum(weights)
+                if total_weight > 0:
+                    weighted_sum = sum(
+                        float(c.progress) * w for c, w in zip(children, weights)
+                    )
+                    self.progress = Decimal(f"{round(weighted_sum / total_weight, 2):.2f}")
+                    self.save(update_fields=["progress", "updated_at"])
+            else:
+                if self.progress != Decimal("0.00") and self.status != self.Status.COMPLETED:
+                    self.progress = Decimal("0.00")
+                    self.save(update_fields=["progress", "updated_at"])
         elif self.progress_method == self.ProgressMethod.CHECKLIST:
             items = ChecklistItem.objects.filter(checklist__task=self)
             total = items.count()
             if total > 0:
                 done = items.filter(is_completed=True).count()
-                self.progress = round((done / total) * 100.0, 2)
+                pct = round((done / total) * 100.0, 2)
+                self.progress = Decimal(f"{pct:.2f}")
                 self.save(update_fields=["progress", "updated_at"])
+            else:
+                if self.progress != Decimal("0.00") and self.status != self.Status.COMPLETED:
+                    self.progress = Decimal("0.00")
+                    self.save(update_fields=["progress", "updated_at"])
         if self.parent_task_id:
             self.parent_task.recalculate_auto_progress()
+        elif self.project_id:
+            self.project.recalculate_progress()
 
     def save(self, *args, **kwargs):
+        from decimal import Decimal
+
         if self.status == self.Status.COMPLETED and not self.completed_at:
             self.completed_at = timezone.now()
-            self.progress = 100.00
+            self.progress = Decimal("100.00")
+            if "update_fields" in kwargs and kwargs["update_fields"] is not None:
+                uf = set(kwargs["update_fields"])
+                uf.update({"completed_at", "progress"})
+                kwargs["update_fields"] = list(uf)
         super().save(*args, **kwargs)
         if self.parent_task_id:
             self.parent_task.recalculate_auto_progress()
+        elif self.project_id:
+            self.project.recalculate_progress()
 
     def __str__(self):
         prefix = "Subtask" if self.parent_task_id else "Task"

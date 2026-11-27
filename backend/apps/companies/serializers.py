@@ -1,9 +1,14 @@
+import re
+import uuid
 from rest_framework import serializers
 from .models import Company, CompanyMembership
 
 
 class CompanySerializer(serializers.ModelSerializer):
     code = serializers.CharField(max_length=50, required=False, allow_blank=True)
+    email = serializers.EmailField(required=False, allow_null=True, allow_blank=True)
+    phone = serializers.CharField(max_length=30, required=False, allow_null=True, allow_blank=True)
+    is_active = serializers.BooleanField(required=False)
     members_count = serializers.SerializerMethodField()
 
     class Meta:
@@ -15,10 +20,10 @@ class CompanySerializer(serializers.ModelSerializer):
             "email",
             "phone",
             "address",
-            "is_active",
-            "status",
             "logo",
             "contact_information",
+            "is_active",
+            "status",
             "working_calendar",
             "members_count",
             "created_at",
@@ -39,6 +44,78 @@ class CompanySerializer(serializers.ModelSerializer):
         return obj.memberships.filter(
             is_active=True, status=CompanyMembership.Status.ACTIVE
         ).count()
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        contact = instance.contact_information if isinstance(instance.contact_information, dict) else {}
+        if not data.get("email") and contact.get("email"):
+            data["email"] = contact.get("email")
+        if not data.get("phone") and contact.get("phone"):
+            data["phone"] = contact.get("phone")
+        return data
+
+    def _generate_code(self, name: str) -> str:
+        base = re.sub(r"[^A-Z0-9]+", "-", (name or "COMP").upper()).strip("-")[:16] or "COMP"
+        candidate = base
+        if not Company.objects.filter(code__iexact=candidate).exists():
+            return candidate
+        return f"{base[:10]}-{uuid.uuid4().hex[:4].upper()}"
+
+    def create(self, validated_data):
+        if not validated_data.get("code"):
+            validated_data["code"] = self._generate_code(validated_data.get("name", ""))
+        else:
+            validated_data["code"] = validated_data["code"].strip().upper()
+
+        if "email" in validated_data and validated_data["email"] == "":
+            validated_data["email"] = None
+        if "phone" in validated_data and validated_data["phone"] == "":
+            validated_data["phone"] = None
+
+        contact = dict(validated_data.get("contact_information") or {})
+        if validated_data.get("email"):
+            contact.setdefault("email", validated_data["email"])
+        if validated_data.get("phone"):
+            contact.setdefault("phone", validated_data["phone"])
+        if contact:
+            validated_data["contact_information"] = contact
+
+        if "is_active" in validated_data:
+            validated_data["status"] = (
+                Company.Status.ACTIVE if validated_data["is_active"] else Company.Status.INACTIVE
+            )
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        if "code" in validated_data and validated_data["code"]:
+            validated_data["code"] = validated_data["code"].strip().upper()
+        elif "code" in validated_data and not validated_data["code"]:
+            validated_data.pop("code")
+
+        if "email" in validated_data and validated_data["email"] == "":
+            validated_data["email"] = None
+        if "phone" in validated_data and validated_data["phone"] == "":
+            validated_data["phone"] = None
+
+        if "email" in validated_data or "phone" in validated_data:
+            contact = dict(
+                validated_data.get("contact_information")
+                or (instance.contact_information if isinstance(instance.contact_information, dict) else {})
+            )
+            if "email" in validated_data:
+                contact["email"] = validated_data["email"]
+            if "phone" in validated_data:
+                contact["phone"] = validated_data["phone"]
+            validated_data["contact_information"] = contact
+
+        if "is_active" in validated_data:
+            validated_data["status"] = (
+                Company.Status.ACTIVE if validated_data["is_active"] else Company.Status.INACTIVE
+            )
+        elif "status" in validated_data:
+            validated_data["is_active"] = validated_data["status"] == Company.Status.ACTIVE
+
+        return super().update(instance, validated_data)
 
 
 class CompanyMembershipSerializer(serializers.ModelSerializer):

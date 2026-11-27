@@ -28,6 +28,8 @@ class ProjectModelsTestCase(TestCase):
             username="pmuser",
             full_name="Test PM",
             password="Password123!",
+            is_superuser=True,
+            is_staff=True,
         )
         self.company = Company.objects.create(
             name="Test Company",

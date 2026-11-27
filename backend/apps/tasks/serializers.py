@@ -1,8 +1,12 @@
+from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.utils import timezone
 from rest_framework import serializers
+from rest_framework.exceptions import PermissionDenied as DrfPermissionDenied
 from apps.accounts.models import User
 from apps.common.serializers import CompanyScopedValidationMixin
+from apps.notifications.models import Notification
 from apps.organization.models import Team
 from .models import (
     Attachment,
@@ -18,15 +22,31 @@ from .models import (
     TaskTag,
     TaskTagAssignment,
 )
-from .services import sync_task_associations_service
+from .services import (
+    analyze_task_dependency_impact,
+    compute_task_schedule_metrics,
+    evaluate_dependency_edge,
+    evaluate_task_dependencies,
+    get_allowed_next_statuses,
+    get_company_working_calendar,
+    get_file_category,
+    serialize_working_calendar,
+    store_and_create_attachment_service,
+    sync_task_associations_service,
+    transition_task_status_service,
+    validate_attachment_file,
+    validate_task_dependency_service,
+)
 
 ALLOWED_ATTACHMENT_MIME_PREFIXES = (
     "application/pdf",
     "application/msword",
     "application/vnd.",
     "image/",
+    "video/",
     "text/",
     "application/zip",
+    "application/x-zip-compressed",
     "application/json",
 )
 MAX_ATTACHMENT_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
@@ -100,46 +120,90 @@ class TaskAssignmentSerializer(CompanyScopedValidationMixin, serializers.ModelSe
 
 
 class TaskDependencySerializer(serializers.ModelSerializer):
+    task_title = serializers.CharField(source="task.title", read_only=True)
+    task_status = serializers.CharField(source="task.status", read_only=True)
+    task_start_date = serializers.DateField(source="task.start_date", read_only=True)
+    task_due_date = serializers.DateField(source="task.due_date", read_only=True)
     depends_on_title = serializers.CharField(source="depends_on_task.title", read_only=True)
     depends_on_status = serializers.CharField(source="depends_on_task.status", read_only=True)
+    depends_on_priority = serializers.CharField(source="depends_on_task.priority", read_only=True)
+    depends_on_start_date = serializers.DateField(source="depends_on_task.start_date", read_only=True)
+    depends_on_due_date = serializers.DateField(source="depends_on_task.due_date", read_only=True)
+    depends_on_owner_name = serializers.CharField(
+        source="depends_on_task.task_owner.full_name", read_only=True, default=None
+    )
+    depends_on_is_overdue = serializers.SerializerMethodField()
+    is_satisfied_for_start = serializers.SerializerMethodField()
+    is_satisfied_for_complete = serializers.SerializerMethodField()
+    schedule_conflict = serializers.SerializerMethodField()
 
     class Meta:
         model = TaskDependency
         fields = [
             "id",
             "task",
+            "task_title",
+            "task_status",
+            "task_start_date",
+            "task_due_date",
             "depends_on_task",
             "depends_on_title",
             "depends_on_status",
+            "depends_on_priority",
+            "depends_on_start_date",
+            "depends_on_due_date",
+            "depends_on_owner_name",
+            "depends_on_is_overdue",
             "dependency_type",
+            "is_satisfied_for_start",
+            "is_satisfied_for_complete",
+            "schedule_conflict",
             "created_at",
         ]
         read_only_fields = ["id", "created_at"]
 
+    def _eval(self, obj):
+        cache_attr = "_cached_dep_edge_eval"
+        if not hasattr(obj, cache_attr):
+            setattr(
+                obj,
+                cache_attr,
+                evaluate_dependency_edge(
+                    task=obj.task,
+                    prereq=obj.depends_on_task,
+                    dependency_type=obj.dependency_type,
+                ),
+            )
+        return getattr(obj, cache_attr)
+
+    def get_depends_on_is_overdue(self, obj):
+        return self._eval(obj)["prereq_is_overdue"]
+
+    def get_is_satisfied_for_start(self, obj):
+        return self._eval(obj)["is_satisfied_for_start"]
+
+    def get_is_satisfied_for_complete(self, obj):
+        return self._eval(obj)["is_satisfied_for_complete"]
+
+    def get_schedule_conflict(self, obj):
+        return self._eval(obj)["schedule_conflict"]
+
     def validate(self, attrs):
         task = attrs.get("task") or getattr(self.instance, "task", None)
         depends_on_task = attrs.get("depends_on_task") or getattr(self.instance, "depends_on_task", None)
+        dependency_type = attrs.get("dependency_type") or getattr(
+            self.instance, "dependency_type", TaskDependency.DependencyType.FINISH_TO_START
+        )
         if task and depends_on_task:
-            if task.id == depends_on_task.id:
-                raise serializers.ValidationError("A task cannot depend on itself (DB Design §5).")
-            if task.project_id != depends_on_task.project_id:
-                raise serializers.ValidationError(
-                    "Dependent tasks must belong to the same project (DB Design §4.4 & §5)."
+            try:
+                validate_task_dependency_service(
+                    task=task,
+                    depends_on_task=depends_on_task,
+                    dependency_type=dependency_type,
                 )
-            # Cycle detection across TaskDependency graph
-            visited = {task.id}
-            queue = [depends_on_task.id]
-            while queue:
-                current_id = queue.pop(0)
-                if current_id in visited:
-                    raise serializers.ValidationError(
-                        "Circular task dependency detected; dependency cycles are not allowed (DB Design §5)."
-                    )
-                visited.add(current_id)
-                prereqs = TaskDependency.objects.filter(task_id=current_id).values_list(
-                    "depends_on_task_id", flat=True
-                )
-                queue.extend(prereqs)
+            except DjangoValidationError as exc:
+                msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
+                raise serializers.ValidationError(msg)
         return attrs
 
 
@@ -211,44 +275,31 @@ class CommentMentionSerializer(CompanyScopedValidationMixin, serializers.ModelSe
         return attrs
 
 
-class TaskCommentSerializer(serializers.ModelSerializer):
-    author_name = serializers.CharField(source="author.full_name", read_only=True)
-    mentions = CommentMentionSerializer(many=True, read_only=True)
-
-    class Meta:
-        model = TaskComment
-        fields = [
-            "id",
-            "task",
-            "author",
-            "author_name",
-            "parent_comment",
-            "content",
-            "mentions",
-            "created_at",
-            "updated_at",
-        ]
-        read_only_fields = ["id", "created_at", "updated_at"]
-        extra_kwargs = {"author": {"required": False}}
-
-    def validate(self, attrs):
-        task = attrs.get("task") or getattr(self.instance, "task", None)
-        parent_comment = attrs.get("parent_comment")
-        if task and parent_comment and parent_comment.task_id != task.id:
-            raise serializers.ValidationError("Parent comment must belong to the same task.")
-        return attrs
-
-
 class AttachmentSerializer(serializers.ModelSerializer):
     """
-    Per DB Design §5 & §7 Rule #9:
-    - Validates MIME type and file size on upload.
+    SRS §7.8 & DB Design §4.5, §5, §6 & §7 Rule #9:
+    - Supports multipart file upload (`file`), base64 upload (`file_content_base64`), or metadata registration.
+    - Validates approved extensions (JPG, JPEG, PNG, WEBP, PDF, DOCX, XLSX, PPTX, TXT, MP4, ZIP),
+      MIME types, and configurable file-size limits, rejecting dangerous executables.
     - Does NOT expose raw unrestricted `storage_key` on read (`write_only=True`);
-      instead returns a permission-checked `download_url`.
+      instead returns permission-checked `download_url`, `preview_url`, and `file_category`.
     """
 
     uploaded_by_name = serializers.CharField(source="uploaded_by.full_name", read_only=True)
     download_url = serializers.SerializerMethodField()
+    preview_url = serializers.SerializerMethodField()
+    file_category = serializers.SerializerMethodField()
+
+    file = serializers.FileField(required=False, write_only=True)
+    file_content_base64 = serializers.CharField(
+        required=False, allow_blank=True, write_only=True
+    )
+    task = serializers.PrimaryKeyRelatedField(
+        queryset=Task.objects.all(), required=False, allow_null=True, write_only=True
+    )
+    comment = serializers.PrimaryKeyRelatedField(
+        queryset=TaskComment.objects.all(), required=False, allow_null=True, write_only=True
+    )
 
     class Meta:
         model = Attachment
@@ -259,29 +310,116 @@ class AttachmentSerializer(serializers.ModelSerializer):
             "file_name",
             "storage_key",
             "download_url",
+            "preview_url",
+            "file_category",
             "mime_type",
             "file_size_bytes",
             "checksum",
             "uploaded_at",
+            "file",
+            "file_content_base64",
+            "task",
+            "comment",
         ]
-        read_only_fields = ["id", "uploaded_at", "download_url"]
+        read_only_fields = ["id", "uploaded_at", "download_url", "preview_url", "file_category"]
         extra_kwargs = {
-            "storage_key": {"write_only": True},
+            "storage_key": {"write_only": True, "required": False},
             "uploaded_by": {"required": False},
+            "file_name": {"required": False},
+            "mime_type": {"required": False},
+            "file_size_bytes": {"required": False},
         }
 
     def get_download_url(self, obj):
         return f"/api/tasks/attachments/{obj.id}/download/"
 
-    def validate_mime_type(self, value):
-        if not value or not value.startswith(ALLOWED_ATTACHMENT_MIME_PREFIXES):
-            raise serializers.ValidationError(f"Unsupported MIME type '{value}'.")
-        return value
+    def get_preview_url(self, obj):
+        return f"/api/tasks/attachments/{obj.id}/download/?inline=1"
 
-    def validate_file_size_bytes(self, value):
-        if value <= 0 or value > MAX_ATTACHMENT_SIZE_BYTES:
-            raise serializers.ValidationError("File size must be between 1 byte and 50 MB.")
-        return value
+    def get_file_category(self, obj):
+        return get_file_category(obj.file_name, obj.mime_type)
+
+    def validate(self, attrs):
+        uploaded_file = attrs.get("file")
+        b64_content = attrs.get("file_content_base64")
+        file_name = attrs.get("file_name") or (getattr(uploaded_file, "name", None) if uploaded_file else None)
+        mime_type = attrs.get("mime_type") or (
+            getattr(uploaded_file, "content_type", None) if uploaded_file else None
+        )
+        file_size = attrs.get("file_size_bytes")
+        if uploaded_file is not None and file_size is None:
+            file_size = getattr(uploaded_file, "size", 0)
+        elif b64_content and file_size is None:
+            payload = b64_content.split(",", 1)[-1]
+            file_size = max(1, int(len(payload) * 3 / 4))
+
+        task_obj = attrs.get("task")
+        comment_obj = attrs.get("comment")
+        company = None
+        if task_obj:
+            company = task_obj.project.company
+        elif comment_obj:
+            company = comment_obj.task.project.company
+
+        try:
+            validate_attachment_file(
+                file_name=file_name or "",
+                mime_type=mime_type or "",
+                file_size_bytes=file_size if file_size is not None else 0,
+                company=company,
+            )
+        except DjangoValidationError as exc:
+            msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
+            raise serializers.ValidationError({"detail": msg})
+
+        return attrs
+
+    @transaction.atomic
+    def create(self, validated_data):
+        uploaded_file = validated_data.pop("file", None)
+        b64_content = validated_data.pop("file_content_base64", None)
+        task_obj = validated_data.pop("task", None)
+        comment_obj = validated_data.pop("comment", None)
+        uploaded_by = validated_data.get("uploaded_by")
+        if not uploaded_by:
+            request = self.context.get("request")
+            if request and getattr(request, "user", None) and request.user.is_authenticated:
+                uploaded_by = request.user
+            elif task_obj:
+                uploaded_by = task_obj.task_owner or task_obj.created_by
+            elif comment_obj:
+                uploaded_by = comment_obj.author
+            else:
+                uploaded_by = User.objects.first()
+
+        try:
+            if uploaded_file is not None or b64_content:
+                return store_and_create_attachment_service(
+                    uploaded_by=uploaded_by,
+                    uploaded_file=uploaded_file,
+                    file_name=validated_data.get("file_name"),
+                    mime_type=validated_data.get("mime_type"),
+                    file_size_bytes=validated_data.get("file_size_bytes"),
+                    file_content_base64=b64_content,
+                    task=task_obj,
+                    comment=comment_obj,
+                )
+
+            # Metadata registration path (e.g., external storage key provided directly)
+            if not validated_data.get("storage_key"):
+                validated_data["storage_key"] = f"attachments/{validated_data.get('file_name', 'file')}"
+            validated_data["uploaded_by"] = uploaded_by
+            attachment = super().create(validated_data)
+            if comment_obj is not None:
+                CommentAttachment.objects.get_or_create(comment=comment_obj, attachment=attachment)
+                if task_obj is None:
+                    task_obj = comment_obj.task
+            if task_obj is not None:
+                TaskAttachment.objects.get_or_create(task=task_obj, attachment=attachment)
+            return attachment
+        except DjangoValidationError as exc:
+            msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
+            raise serializers.ValidationError({"detail": msg})
 
 
 class TaskAttachmentSerializer(serializers.ModelSerializer):
@@ -300,6 +438,108 @@ class CommentAttachmentSerializer(serializers.ModelSerializer):
         model = CommentAttachment
         fields = ["id", "comment", "attachment", "attachment_detail"]
         read_only_fields = ["id"]
+
+
+class TaskCommentSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
+    author_name = serializers.CharField(source="author.full_name", read_only=True)
+    mentions = CommentMentionSerializer(many=True, read_only=True)
+    attachments = CommentAttachmentSerializer(
+        source="comment_attachments", many=True, read_only=True
+    )
+    mentioned_user_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        write_only=True,
+        help_text="List of authorized company User UUIDs mentioned in this comment.",
+    )
+    attachment_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        write_only=True,
+        help_text="Optional list of Attachment UUIDs to attach to this comment (SRS §7.7).",
+    )
+    replies_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TaskComment
+        fields = [
+            "id",
+            "task",
+            "author",
+            "author_name",
+            "parent_comment",
+            "content",
+            "mentions",
+            "mentioned_user_ids",
+            "attachments",
+            "attachment_ids",
+            "replies_count",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at"]
+        extra_kwargs = {"author": {"required": False}}
+
+    def get_replies_count(self, obj):
+        return obj.replies.count()
+
+    def validate(self, attrs):
+        task = attrs.get("task") or getattr(self.instance, "task", None)
+        parent_comment = attrs.get("parent_comment")
+        if task and parent_comment and parent_comment.task_id != task.id:
+            raise serializers.ValidationError("Parent comment must belong to the same task.")
+        if task and "mentioned_user_ids" in attrs and attrs["mentioned_user_ids"]:
+            for u_obj in User.objects.filter(id__in=attrs["mentioned_user_ids"]):
+                self.validate_user_in_company(
+                    u_obj, task.project.company, field_label="Mentioned user"
+                )
+        return attrs
+
+    def _sync_mentions(self, comment: TaskComment, mentioned_user_ids):
+        if mentioned_user_ids is None:
+            return
+        unique_ids = {str(uid) for uid in mentioned_user_ids if uid}
+        for uid_str in unique_ids:
+            _, created = CommentMention.objects.get_or_create(
+                comment=comment,
+                mentioned_user_id=uid_str,
+            )
+            if created and str(comment.author_id) != uid_str:
+                Notification.objects.create(
+                    user_id=uid_str,
+                    notification_type="COMMENT_MENTION",
+                    title=f"Mentioned in Task: {comment.task.title}",
+                    message=f"{comment.author.full_name} mentioned you: \"{comment.content[:120]}\"",
+                    related_project=comment.task.project,
+                    related_task=comment.task,
+                )
+
+    def _sync_attachments(self, comment: TaskComment, attachment_ids):
+        if not attachment_ids:
+            return
+        for aid in {str(a) for a in attachment_ids if a}:
+            att = Attachment.objects.filter(id=aid).first()
+            if att:
+                CommentAttachment.objects.get_or_create(comment=comment, attachment=att)
+                TaskAttachment.objects.get_or_create(task=comment.task, attachment=att)
+
+    @transaction.atomic
+    def create(self, validated_data):
+        mentioned_user_ids = validated_data.pop("mentioned_user_ids", None)
+        attachment_ids = validated_data.pop("attachment_ids", None)
+        comment = super().create(validated_data)
+        self._sync_mentions(comment, mentioned_user_ids)
+        self._sync_attachments(comment, attachment_ids)
+        return comment
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        mentioned_user_ids = validated_data.pop("mentioned_user_ids", None)
+        attachment_ids = validated_data.pop("attachment_ids", None)
+        comment = super().update(instance, validated_data)
+        self._sync_mentions(comment, mentioned_user_ids)
+        self._sync_attachments(comment, attachment_ids)
+        return comment
 
 
 class SubtaskNestedSerializer(serializers.ModelSerializer):
@@ -342,7 +582,17 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
     is_subtask = serializers.BooleanField(read_only=True)
     is_overdue = serializers.SerializerMethodField()
     days_remaining = serializers.SerializerMethodField()
+    days_overdue = serializers.SerializerMethodField()
+    working_days_remaining = serializers.SerializerMethodField()
+    working_days_overdue = serializers.SerializerMethodField()
+    planned_working_days = serializers.SerializerMethodField()
     due_status = serializers.SerializerMethodField()
+    overdue_severity = serializers.SerializerMethodField()
+    is_dependency_blocked = serializers.SerializerMethodField()
+    blocking_prerequisites_count = serializers.SerializerMethodField()
+    downstream_dependents_count = serializers.SerializerMethodField()
+    dependency_warnings_count = serializers.SerializerMethodField()
+    allowed_transitions = serializers.SerializerMethodField()
     subtasks_count = serializers.SerializerMethodField()
     actual_effort_hours = serializers.SerializerMethodField()
     active_assignments = serializers.SerializerMethodField()
@@ -418,7 +668,17 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
             "approval_required",
             "is_overdue",
             "days_remaining",
+            "days_overdue",
+            "working_days_remaining",
+            "working_days_overdue",
+            "planned_working_days",
             "due_status",
+            "overdue_severity",
+            "is_dependency_blocked",
+            "blocking_prerequisites_count",
+            "downstream_dependents_count",
+            "dependency_warnings_count",
+            "allowed_transitions",
             "subtasks_count",
             "active_assignments",
             "tags",
@@ -492,6 +752,29 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
                                 {"parent_task": "Circular parent-subtask relationship detected."}
                             )
                         anc = anc.parent_task
+
+                # Enforce configurable subtask nesting depth limit (SRS §8.1 & §20.2)
+                from apps.system_settings.models import SystemSetting
+
+                depth_setting = (
+                    SystemSetting.objects.filter(company=company, setting_key="subtask_max_depth").first()
+                    or SystemSetting.objects.filter(company__isnull=True, setting_key="subtask_max_depth").first()
+                )
+                max_depth = 3
+                if depth_setting and isinstance(depth_setting.setting_value, (int, str)):
+                    try:
+                        max_depth = int(depth_setting.setting_value)
+                    except (TypeError, ValueError):
+                        max_depth = 3
+                depth = 1
+                curr = parent_task.parent_task
+                while curr is not None:
+                    depth += 1
+                    curr = curr.parent_task
+                if depth > max_depth:
+                    raise serializers.ValidationError(
+                        {"parent_task": f"Subtask nesting depth cannot exceed the configured limit of {max_depth} level(s) (SRS §8.1)."}
+                    )
 
             if phase and phase.project_id != project.id:
                 raise serializers.ValidationError(
@@ -585,12 +868,37 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
     def update(self, instance, validated_data):
         assoc = self._extract_association_fields(validated_data)
         assoc.pop("initial_checklist_items", None)
+
+        requested_status = validated_data.pop("status", None)
         task = super().update(instance, validated_data)
         sync_task_associations_service(
             task=task,
             actor_id=task.created_by_id,
             **assoc,
         )
+
+        if requested_status and requested_status != task.status:
+            request = self.context.get("request")
+            actor = (
+                request.user
+                if request and getattr(request, "user", None) and request.user.is_authenticated
+                else task.created_by
+            )
+            try:
+                transition_task_status_service(
+                    task=task,
+                    new_status=requested_status,
+                    actor=actor,
+                )
+            except DjangoPermissionDenied as exc:
+                raise DrfPermissionDenied(str(exc))
+            except DjangoValidationError as exc:
+                msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
+                raise serializers.ValidationError({"status": msg})
+
+        if task.progress_method in (Task.ProgressMethod.SUBTASKS, Task.ProgressMethod.CHECKLIST):
+            task.recalculate_auto_progress()
+
         from apps.projects.services import recalculate_project_progress_service
 
         recalculate_project_progress_service(project=task.project)
@@ -614,29 +922,81 @@ class TaskSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
         ]
         return data
 
+    def _get_schedule_metrics(self, obj):
+        cache_attr = "_cached_schedule_metrics"
+        if not hasattr(obj, cache_attr):
+            cal_cache = self.context.setdefault("_company_calendar_cache", {})
+            company = getattr(getattr(obj, "project", None), "company", None)
+            comp_id = getattr(company, "id", None)
+            if comp_id not in cal_cache:
+                cal_cache[comp_id] = get_company_working_calendar(company)
+            setattr(
+                obj,
+                cache_attr,
+                compute_task_schedule_metrics(obj, calendar_cfg=cal_cache[comp_id]),
+            )
+        return getattr(obj, cache_attr)
+
+    def _get_dep_eval(self, obj):
+        cache_attr = "_cached_dep_eval"
+        if not hasattr(obj, cache_attr):
+            setattr(obj, cache_attr, evaluate_task_dependencies(obj))
+        return getattr(obj, cache_attr)
+
     def get_is_overdue(self, obj):
-        if obj.due_date and obj.status not in [Task.Status.COMPLETED, Task.Status.CANCELLED]:
-            return obj.due_date < timezone.now().date()
-        return False
+        return self._get_schedule_metrics(obj)["is_overdue"]
 
     def get_days_remaining(self, obj):
-        if not obj.due_date or obj.status in [Task.Status.COMPLETED, Task.Status.CANCELLED]:
-            return None
-        return (obj.due_date - timezone.now().date()).days
+        return self._get_schedule_metrics(obj)["days_remaining"]
+
+    def get_days_overdue(self, obj):
+        return self._get_schedule_metrics(obj)["days_overdue"]
+
+    def get_working_days_remaining(self, obj):
+        return self._get_schedule_metrics(obj)["working_days_remaining"]
+
+    def get_working_days_overdue(self, obj):
+        return self._get_schedule_metrics(obj)["working_days_overdue"]
+
+    def get_planned_working_days(self, obj):
+        return self._get_schedule_metrics(obj)["planned_working_days"]
 
     def get_due_status(self, obj):
-        if obj.status in [Task.Status.COMPLETED, Task.Status.CANCELLED]:
-            return "Completed"
-        if not obj.due_date:
-            return "No Due Date"
-        diff = (obj.due_date - timezone.now().date()).days
-        if diff < 0:
-            return "Overdue"
-        if diff == 0:
-            return "Due Today"
-        if diff <= 3:
-            return "Due Soon"
-        return "On Track"
+        return self._get_schedule_metrics(obj)["due_status"]
+
+    def get_overdue_severity(self, obj):
+        return self._get_schedule_metrics(obj)["overdue_severity"]
+
+    def get_is_dependency_blocked(self, obj):
+        return self._get_dep_eval(obj)["is_dependency_blocked"]
+
+    def get_blocking_prerequisites_count(self, obj):
+        return self._get_dep_eval(obj)["blocking_prerequisites_count"]
+
+    def get_downstream_dependents_count(self, obj):
+        return len(list(obj.dependent_tasks.all()))
+
+    def get_dependency_warnings_count(self, obj):
+        dep_eval = self._get_dep_eval(obj)
+        count = len(dep_eval["schedule_conflicts"]) + len(dep_eval["at_risk_prerequisites"])
+        metrics = self._get_schedule_metrics(obj)
+        if metrics["is_overdue"] or obj.status in (Task.Status.BLOCKED, Task.Status.ON_HOLD):
+            open_down = sum(
+                1
+                for d in obj.dependent_tasks.all()
+                if d.task.status not in (Task.Status.COMPLETED, Task.Status.CANCELLED)
+            )
+            count += open_down
+        return count
+
+    def get_allowed_transitions(self, obj):
+        request = self.context.get("request")
+        actor = (
+            request.user
+            if request and getattr(request, "user", None) and request.user.is_authenticated
+            else None
+        )
+        return get_allowed_next_statuses(task=obj, actor=actor)
 
     def get_subtasks_count(self, obj):
         if hasattr(obj, "annotated_subtasks_count"):
@@ -683,8 +1043,15 @@ class TaskDetailSerializer(TaskSerializer):
     subtasks = SubtaskNestedSerializer(many=True, read_only=True)
     assignments = TaskAssignmentSerializer(many=True, read_only=True)
     dependencies = TaskDependencySerializer(many=True, read_only=True)
+    dependent_tasks = TaskDependencySerializer(many=True, read_only=True)
+    dependency_summary = serializers.SerializerMethodField()
+    working_calendar = serializers.SerializerMethodField()
     checklists = ChecklistSerializer(many=True, read_only=True)
     comments = serializers.SerializerMethodField()
+    progress_updates = serializers.SerializerMethodField()
+    reviews = serializers.SerializerMethodField()
+    approval_chain = serializers.SerializerMethodField()
+    review_sla = serializers.SerializerMethodField()
     task_attachments = TaskAttachmentSerializer(many=True, read_only=True)
     history_endpoints = serializers.SerializerMethodField()
 
@@ -693,21 +1060,72 @@ class TaskDetailSerializer(TaskSerializer):
             "subtasks",
             "assignments",
             "dependencies",
+            "dependent_tasks",
+            "dependency_summary",
+            "working_calendar",
             "checklists",
             "comments",
+            "progress_updates",
+            "reviews",
+            "approval_chain",
+            "review_sla",
             "task_attachments",
             "history_endpoints",
         ]
+
+    def get_dependency_summary(self, obj):
+        cal_cache = self.context.setdefault("_company_calendar_cache", {})
+        company = getattr(getattr(obj, "project", None), "company", None)
+        comp_id = getattr(company, "id", None)
+        if comp_id not in cal_cache:
+            cal_cache[comp_id] = get_company_working_calendar(company)
+        return analyze_task_dependency_impact(obj, calendar_cfg=cal_cache[comp_id])
+
+    def get_working_calendar(self, obj):
+        cal_cache = self.context.setdefault("_company_calendar_cache", {})
+        company = getattr(getattr(obj, "project", None), "company", None)
+        comp_id = getattr(company, "id", None)
+        if comp_id not in cal_cache:
+            cal_cache[comp_id] = get_company_working_calendar(company)
+        return serialize_working_calendar(cal_cache[comp_id])
 
     def get_comments(self, obj):
         # Return latest 20 comments in detail view; full history is paginated at /api/tasks/{id}/comments/
         recent_comments = obj.comments.all()[:20]
         return TaskCommentSerializer(recent_comments, many=True).data
 
+    def get_progress_updates(self, obj):
+        from apps.tracking.serializers import ProgressUpdateSerializer
+
+        recent_updates = obj.progress_updates.all()[:20]
+        return ProgressUpdateSerializer(recent_updates, many=True).data
+
+    def get_reviews(self, obj):
+        from apps.reviews.serializers import TaskReviewSerializer
+
+        recent_reviews = sorted(
+            obj.reviews.all(),
+            key=lambda r: (r.review_round, r.reviewed_at),
+            reverse=True,
+        )[:20]
+        return TaskReviewSerializer(recent_reviews, many=True, context={"omit_chain": True}).data
+
+    def get_approval_chain(self, obj):
+        from apps.reviews.services import resolve_task_approval_chain
+
+        return resolve_task_approval_chain(obj)
+
+    def get_review_sla(self, obj):
+        from apps.reviews.services import compute_task_review_sla
+
+        return compute_task_review_sla(obj)
+
     def get_history_endpoints(self, obj):
         return {
             "comments": f"/api/tasks/{obj.id}/comments/",
             "progress_updates": f"/api/tasks/{obj.id}/progress-updates/",
             "reviews": f"/api/tasks/{obj.id}/reviews/",
+            "review_chain": f"/api/tasks/{obj.id}/review-chain/",
             "time_entries": f"/api/tasks/{obj.id}/time-entries/",
+            "dependency_impact": f"/api/tasks/{obj.id}/dependency-impact/",
         }

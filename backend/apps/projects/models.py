@@ -74,12 +74,9 @@ class Project(models.Model):
             raise ValidationError("Every active project must have an accountable project manager (SRS §1.4 #2).")
 
     def recalculate_progress(self):
-        top_tasks = self.tasks.filter(parent_task__isnull=True).exclude(status="Cancelled")
-        total = top_tasks.count()
-        if total > 0:
-            avg_progress = sum(float(t.progress) for t in top_tasks) / total
-            self.progress = round(avg_progress, 2)
-            self.save(update_fields=["progress"])
+        from apps.projects.services import recalculate_project_progress_service
+
+        return recalculate_project_progress_service(project=self)
 
     def __str__(self):
         return f"{self.name} [{self.code}]"

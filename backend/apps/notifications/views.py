@@ -18,7 +18,7 @@ class NotificationViewSet(viewsets.ModelViewSet):
     """
     User-isolated Notification API (SRS §13 & PERM-02):
     - Authenticated active users only see and manage their own notifications.
-    - CEO can inspect and manage all notifications.
+    - CEO can inspect and manage all notifications (and filter `?mine=true` for own).
     """
 
     serializer_class = NotificationSerializer
@@ -31,11 +31,13 @@ class NotificationViewSet(viewsets.ModelViewSet):
         qs = (
             Notification.objects.select_related("user", "related_task", "related_project")
             .prefetch_related("deliveries")
-            .all()
+            .order_by("-created_at")
         )
-        if is_ceo(self.request.user):
+        user = self.request.user
+        mine = str(self.request.query_params.get("mine", "")).lower() in ("true", "1", "yes")
+        if is_ceo(user) and not mine:
             return qs
-        return qs.filter(user=self.request.user)
+        return qs.filter(user=user)
 
     def perform_create(self, serializer):
         target_user = serializer.validated_data.get("user")
@@ -60,6 +62,21 @@ class NotificationViewSet(viewsets.ModelViewSet):
         notif.read_at = timezone.now()
         notif.save(update_fields=["is_read", "read_at"])
         return Response(NotificationSerializer(notif).data)
+
+    @action(detail=False, methods=["post"], url_path="mark-all-read")
+    def mark_all_read(self, request):
+        qs = self.get_queryset().filter(is_read=False)
+        if request.user and request.user.is_authenticated:
+            qs = qs.filter(user=request.user)
+        updated = qs.update(is_read=True, read_at=timezone.now())
+        return Response({"marked_read": updated})
+
+    @action(detail=False, methods=["get"], url_path="unread-count")
+    def unread_count(self, request):
+        qs = self.get_queryset().filter(is_read=False)
+        if request.user and request.user.is_authenticated:
+            qs = qs.filter(user=request.user)
+        return Response({"unread_count": qs.count()})
 
 
 class NotificationDeliveryViewSet(viewsets.ModelViewSet):
