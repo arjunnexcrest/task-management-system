@@ -62,19 +62,62 @@ def api_root(request):
     )
 
 
+from rest_framework import status as drf_status
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response as DRFResponse
+from apps.common.permissions import IsActiveUser
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated, IsActiveUser])
 def lookup_data(request):
     from apps.accounts.models import User
+    from apps.common.permissions import (
+        get_company_id_from_request,
+        get_user_company_ids,
+        is_ceo,
+    )
     from apps.companies.models import Company, CompanyMembership
     from apps.organization.models import Department, DepartmentMembership, Team, TeamMembership
 
-    companies = list(Company.objects.values("id", "name", "code", "status"))
+    user = request.user
+    ceo = is_ceo(user)
+    requested_company_id = get_company_id_from_request(request)
+
+    if ceo:
+        allowed_company_ids = None
+    else:
+        allowed_company_ids = get_user_company_ids(user)
+        if not allowed_company_ids:
+            return DRFResponse(
+                {"detail": "You are not an active member of any company."},
+                status=drf_status.HTTP_403_FORBIDDEN,
+            )
+        if requested_company_id:
+            allowed_strs = {str(cid) for cid in allowed_company_ids}
+            if str(requested_company_id) not in allowed_strs:
+                return DRFResponse(
+                    {"detail": "You are not an active member of this company."},
+                    status=drf_status.HTTP_403_FORBIDDEN,
+                )
+
+    companies_qs = Company.objects.all()
+    if allowed_company_ids is not None:
+        companies_qs = companies_qs.filter(id__in=allowed_company_ids, is_active=True)
+    if requested_company_id:
+        companies_qs = companies_qs.filter(id=requested_company_id)
+    companies = list(companies_qs.values("id", "name", "code", "status"))
+    scoped_company_ids = {c["id"] for c in companies}
 
     head_map = {}
     user_dept_ids: dict[str, list[str]] = {}
     user_dept_names: dict[str, list[str]] = {}
-    for dm in DepartmentMembership.objects.filter(
-        status=DepartmentMembership.Status.ACTIVE
-    ).select_related("user", "department"):
+    dm_qs = DepartmentMembership.objects.filter(
+        status=DepartmentMembership.Status.ACTIVE,
+        department__company_id__in=scoped_company_ids,
+    ).select_related("user", "department")
+    for dm in dm_qs:
         uid_s = str(dm.user_id)
         did_s = str(dm.department_id)
         user_dept_ids.setdefault(uid_s, []).append(did_s)
@@ -86,7 +129,7 @@ def lookup_data(request):
             }
 
     departments = []
-    for d in Department.objects.all():
+    for d in Department.objects.filter(company_id__in=scoped_company_ids):
         head = head_map.get(d.id)
         departments.append(
             {
@@ -104,9 +147,11 @@ def lookup_data(request):
     team_member_ids_map: dict[str, list[str]] = {}
     user_team_ids: dict[str, list[str]] = {}
     user_team_names: dict[str, list[str]] = {}
-    for tm in TeamMembership.objects.filter(
-        status=TeamMembership.Status.ACTIVE
-    ).select_related("user", "team"):
+    tm_qs = TeamMembership.objects.filter(
+        status=TeamMembership.Status.ACTIVE,
+        team__department__company_id__in=scoped_company_ids,
+    ).select_related("user", "team")
+    for tm in tm_qs:
         uid_s = str(tm.user_id)
         tid_s = str(tm.team_id)
         team_member_ids_map.setdefault(tid_s, []).append(uid_s)
@@ -119,7 +164,9 @@ def lookup_data(request):
             }
 
     teams = []
-    for t in Team.objects.select_related("department").all():
+    for t in Team.objects.filter(
+        department__company_id__in=scoped_company_ids
+    ).select_related("department"):
         leader = leader_map.get(t.id)
         tid_s = str(t.id)
         m_ids = team_member_ids_map.get(tid_s, [])
@@ -140,14 +187,18 @@ def lookup_data(request):
         )
 
     user_company_ids: dict[str, list[str]] = {}
+    scoped_user_ids = set()
     for cm in CompanyMembership.objects.filter(
+        company_id__in=scoped_company_ids,
         is_active=True,
         status=CompanyMembership.Status.ACTIVE,
     ):
         user_company_ids.setdefault(str(cm.user_id), []).append(str(cm.company_id))
+        scoped_user_ids.add(cm.user_id)
 
+    users_qs = User.objects.all() if (ceo and not requested_company_id) else User.objects.filter(id__in=scoped_user_ids)
     users = []
-    for u in User.objects.all():
+    for u in users_qs:
         uid_s = str(u.id)
         users.append(
             {
@@ -166,7 +217,7 @@ def lookup_data(request):
             }
         )
 
-    return JsonResponse(
+    return DRFResponse(
         {
             "companies": companies,
             "departments": departments,
@@ -180,6 +231,7 @@ from apps.accounts.urls import user_only_router
 from apps.companies.urls import membership_router
 from apps.organization.urls import (
     department_only_urlpatterns,
+    hierarchy_only_urlpatterns,
     reporting_only_urlpatterns,
     team_only_urlpatterns,
 )
@@ -199,13 +251,14 @@ urlpatterns = [
         SpectacularRedocView.as_view(url_name="schema"),
         name="redoc",
     ),
-    # Auth, Users, Employees, Memberships, Departments, Teams & Reporting APIs
+    # Auth, Users, Employees, Memberships, Departments, Teams, Hierarchy & Reporting APIs
     path("api/auth/", include("apps.accounts.urls")),
     path("api/users/", include(user_only_router.urls)),
     path("api/employees/", include(user_only_router.urls)),
     path("api/memberships/", include(membership_router.urls)),
     path("api/departments/", include(department_only_urlpatterns)),
     path("api/teams/", include(team_only_urlpatterns)),
+    path("api/hierarchy/", include(hierarchy_only_urlpatterns)),
     path("api/reporting-relationships/", include(reporting_only_urlpatterns)),
     # All 13 SRS & Database Design Module APIs Wired
     path("api/accounts/", include("apps.accounts.urls")),

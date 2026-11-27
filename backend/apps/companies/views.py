@@ -25,8 +25,63 @@ class CompanyViewSet(viewsets.ModelViewSet):
     search_fields = ["name", "code", "email", "phone", "address"]
     ordering_fields = ["name", "code", "created_at"]
 
+    def get_permissions(self):
+        if self.action == "my_companies":
+            return [IsAuthenticated(), IsCompanyMember()]
+        return [IsAuthenticated(), IsCEO()]
+
     def perform_destroy(self, instance: Company):
         instance.soft_delete()
+
+    @action(detail=False, methods=["get"], url_path="my-companies")
+    def my_companies(self, request):
+        """
+        GET /api/companies/my-companies/ — Returns active companies the logged-in user belongs to
+        (CEO receives all active companies). Non-members receive 403.
+        """
+        if is_ceo(request.user):
+            qs = Company.objects.filter(is_active=True).order_by("name")
+        else:
+            cids = get_user_company_ids(request.user)
+            qs = Company.objects.filter(id__in=cids, is_active=True).order_by("name")
+        return Response(
+            CompanySerializer(qs, many=True, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["get", "post"], url_path="members")
+    def members(self, request, pk=None):
+        """
+        GET /api/companies/<id>/members/ — List memberships for this company (CEO-only).
+        POST /api/companies/<id>/members/ — Add an employee to this company with a role (CEO-only).
+        """
+        company = self.get_object()
+        if request.method == "POST":
+            payload = dict(request.data)
+            payload["company"] = str(company.id)
+            serializer = CompanyMembershipSerializer(data=payload, context={"request": request})
+            serializer.is_valid(raise_exception=True)
+            membership = serializer.save()
+            return Response(
+                CompanyMembershipSerializer(membership, context={"request": request}).data,
+                status=status.HTTP_201_CREATED,
+            )
+
+        qs = (
+            CompanyMembership.objects.filter(company=company)
+            .select_related("company", "user")
+            .order_by("-is_active", "-joined_at")
+        )
+        is_active_param = request.query_params.get("is_active")
+        if is_active_param is not None:
+            if is_active_param.lower() in ("true", "1", "yes"):
+                qs = qs.filter(is_active=True)
+            elif is_active_param.lower() in ("false", "0", "no"):
+                qs = qs.filter(is_active=False)
+        return Response(
+            CompanyMembershipSerializer(qs, many=True, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
 
 
 class CompanyMembershipViewSet(viewsets.ModelViewSet):
@@ -78,6 +133,16 @@ class CompanyMembershipViewSet(viewsets.ModelViewSet):
     def activate_membership(self, request, pk=None):
         """POST /api/memberships/<id>/activate/ — Reactivate membership."""
         membership = self.get_object()
+        if not membership.company.is_active:
+            return Response(
+                {"detail": "Cannot activate a membership in an inactive company."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not membership.user.is_active:
+            return Response(
+                {"detail": "Cannot activate a membership for an inactive user."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         membership.activate()
         return Response(
             {

@@ -12,21 +12,24 @@ class CompanyScopedValidationMixin:
     def validate_user_in_company(self, user, company, field_label="User"):
         if user is None or company is None:
             return
+        if not getattr(company, "is_active", True):
+            raise serializers.ValidationError(
+                f"Company '{company.name}' is inactive."
+            )
+        if not getattr(user, "is_active", True):
+            raise serializers.ValidationError(
+                f"{field_label} '{user.full_name}' is inactive."
+            )
         if getattr(user, "is_superuser", False) or getattr(company, "company_incharge_id", None) == user.id:
             return
         from apps.companies.models import CompanyMembership
 
-        has_any_memberships = (
-            CompanyMembership.objects.filter(company=company).exists()
-            or CompanyMembership.objects.filter(user=user).exists()
-        )
-        if not has_any_memberships:
-            return
-
         is_member = CompanyMembership.objects.filter(
             company=company,
             user=user,
+            is_active=True,
             status=CompanyMembership.Status.ACTIVE,
+            company__is_active=True,
         ).exists()
         if not is_member:
             raise serializers.ValidationError(

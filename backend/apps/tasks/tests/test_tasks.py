@@ -184,8 +184,12 @@ class APIStructureAndSerializersTestCase(APITestCase):
         )
         self.company_a = Company.objects.create(name="Company A", code="COMP-A")
         self.company_b = Company.objects.create(name="Company B", code="COMP-B")
-        CompanyMembership.objects.create(company=self.company_a, user=self.user_a, status="Active")
-        CompanyMembership.objects.create(company=self.company_b, user=self.user_b, status="Active")
+        CompanyMembership.objects.create(
+            company=self.company_a, user=self.user_a, role="ProjectManager", status="Active"
+        )
+        CompanyMembership.objects.create(
+            company=self.company_b, user=self.user_b, role="ProjectManager", status="Active"
+        )
 
         self.dept_a = Department.objects.create(company=self.company_a, name="Eng A", code="ENGA")
         self.dept_b = Department.objects.create(company=self.company_b, name="Eng B", code="ENGB")
@@ -199,6 +203,7 @@ class APIStructureAndSerializersTestCase(APITestCase):
         )
 
     def test_cross_company_validation_in_task_serializer(self):
+        self.client.force_authenticate(user=self.user_a)
         # Attempting to assign a department or owner from Company B to Project A must fail validation
         res = self.client.post(
             "/api/tasks/",
@@ -228,6 +233,7 @@ class APIStructureAndSerializersTestCase(APITestCase):
         self.assertEqual(res_ok.status_code, 201)
 
     def test_dependency_cycle_detection_and_paginated_history_endpoints(self):
+        self.client.force_authenticate(user=self.user_a)
         t1 = Task.objects.create(project=self.project_a, title="Task A1", created_by=self.user_a)
         t2 = Task.objects.create(project=self.project_a, title="Task A2", created_by=self.user_a)
 

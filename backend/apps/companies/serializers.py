@@ -36,14 +36,19 @@ class CompanySerializer(serializers.ModelSerializer):
         return cleaned
 
     def get_members_count(self, obj):
-        return obj.memberships.filter(status="Active").count()
+        return obj.memberships.filter(
+            is_active=True, status=CompanyMembership.Status.ACTIVE
+        ).count()
 
 
 class CompanyMembershipSerializer(serializers.ModelSerializer):
     company_name = serializers.CharField(source="company.name", read_only=True)
     company_code = serializers.CharField(source="company.code", read_only=True)
+    company_is_active = serializers.BooleanField(source="company.is_active", read_only=True)
     user_full_name = serializers.CharField(source="user.full_name", read_only=True)
     user_email = serializers.CharField(source="user.email", read_only=True)
+    user_designation = serializers.CharField(source="user.designation", read_only=True)
+    user_is_active = serializers.BooleanField(source="user.is_active", read_only=True)
 
     class Meta:
         model = CompanyMembership
@@ -52,9 +57,12 @@ class CompanyMembershipSerializer(serializers.ModelSerializer):
             "user",
             "user_full_name",
             "user_email",
+            "user_designation",
+            "user_is_active",
             "company",
             "company_name",
             "company_code",
+            "company_is_active",
             "role",
             "is_active",
             "status",
@@ -66,6 +74,28 @@ class CompanyMembershipSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         user = attrs.get("user", getattr(self.instance, "user", None))
         company = attrs.get("company", getattr(self.instance, "company", None))
+        is_active = attrs.get("is_active", getattr(self.instance, "is_active", True))
+
+        if self.instance is not None:
+            if "user" in attrs and attrs["user"].pk != self.instance.user_id:
+                raise serializers.ValidationError(
+                    {"user": "Cannot reassign a membership to a different user."}
+                )
+            if "company" in attrs and attrs["company"].pk != self.instance.company_id:
+                raise serializers.ValidationError(
+                    {"company": "Cannot move a membership to a different company."}
+                )
+
+        if company and is_active and not company.is_active:
+            raise serializers.ValidationError(
+                {"company": "Cannot add or activate a membership in an inactive company."}
+            )
+
+        if user and is_active and not user.is_active:
+            raise serializers.ValidationError(
+                {"user": "Cannot add or activate a membership for an inactive user."}
+            )
+
         if user and company:
             qs = CompanyMembership.objects.filter(user=user, company=company)
             if self.instance:

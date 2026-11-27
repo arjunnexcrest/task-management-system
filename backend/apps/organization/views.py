@@ -6,10 +6,8 @@ from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from apps.common.permissions import (
-    IsCompanyMember,
-    IsCompanyMemberOrAllowAnyInDev,
-)
+from rest_framework.views import APIView
+from apps.common.permissions import IsCompanyMember
 from apps.common.selectors import scope_queryset_by_company
 from .models import (
     Department,
@@ -22,6 +20,10 @@ from .permissions import (
     CanManageDepartments,
     CanManageReportingRelationships,
     CanManageTeams,
+)
+from .selectors import (
+    build_hierarchy_employee_detail,
+    build_organization_hierarchy,
 )
 from .serializers import (
     AssignDepartmentHeadSerializer,
@@ -87,6 +89,11 @@ class DepartmentViewSet(viewsets.ModelViewSet):
     def activate_department(self, request, pk=None):
         """POST /api/departments/<id>/activate/ — Reactivate a department."""
         department = self.get_object()
+        if not department.company.is_active:
+            return Response(
+                {"detail": "Cannot activate a department under an inactive company."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         department.activate()
         return Response(
             {
@@ -180,8 +187,19 @@ class DepartmentMembershipViewSet(viewsets.ModelViewSet):
         return [IsAuthenticated(), CanManageDepartments()]
 
     def get_queryset(self):
-        qs = DepartmentMembership.objects.select_related("department", "department__company", "user").all()
+        qs = (
+            DepartmentMembership.objects.select_related("department", "department__company", "user")
+            .all()
+            .order_by("-start_date")
+        )
         return scope_queryset_by_company(qs, self.request, company_lookup="department__company_id")
+
+    def perform_destroy(self, instance: DepartmentMembership):
+        """Soft-end membership instead of hard-deleting to preserve history (DB Design §4.2 & §5)."""
+        instance.status = DepartmentMembership.Status.ENDED
+        instance.is_head = False
+        instance.end_date = date.today()
+        instance.save(update_fields=["status", "is_head", "end_date"])
 
 
 class TeamViewSet(viewsets.ModelViewSet):
@@ -235,6 +253,11 @@ class TeamViewSet(viewsets.ModelViewSet):
     def activate_team(self, request, pk=None):
         """POST /api/teams/<id>/activate/ — Reactivate a team."""
         team = self.get_object()
+        if team.department.status != Department.Status.ACTIVE or not team.department.company.is_active:
+            return Response(
+                {"detail": "Cannot activate a team under an inactive department or company."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         team.activate()
         return Response(
             {
@@ -444,107 +467,108 @@ class ReportingRelationshipViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=["get"], url_path="hierarchy")
     def hierarchy(self, request):
         """
-        GET /api/reporting-relationships/hierarchy/?company=&department=&team=
-        Returns active employees in scope and their active reporting-manager edges
-        for rendering the Organization Chart (CEO -> employee tree).
+        GET /api/reporting-relationships/hierarchy/?company=&department=&team=&search=
+        Returns active employee nodes, reporting edges, reporting tree, and summary
+        for rendering the Organization Chart (SRS §5.3 & §5.4).
         """
-        from apps.companies.models import CompanyMembership
-
-        company_id = request.query_params.get("company")
+        company_id = request.query_params.get("company") or request.headers.get("X-Company-ID")
         department_id = request.query_params.get("department")
         team_id = request.query_params.get("team")
+        search = request.query_params.get("search", "")
+        include_inactive = request.query_params.get("include_inactive", "").lower() in ("true", "1", "yes")
 
-        cm_qs = CompanyMembership.objects.filter(
-            is_active=True,
-            status=CompanyMembership.Status.ACTIVE,
-            user__is_active=True,
-        ).select_related("user", "company")
-        cm_qs = scope_queryset_by_company(cm_qs, request, company_lookup="company_id")
-
-        if department_id:
-            dept_user_ids = DepartmentMembership.objects.filter(
-                department_id=department_id,
-                status=DepartmentMembership.Status.ACTIVE,
-            ).values_list("user_id", flat=True)
-            cm_qs = cm_qs.filter(user_id__in=dept_user_ids)
-
-        if team_id:
-            team_user_ids = TeamMembership.objects.filter(
-                team_id=team_id,
-                status=TeamMembership.Status.ACTIVE,
-            ).values_list("user_id", flat=True)
-            cm_qs = cm_qs.filter(user_id__in=team_user_ids)
-
-        memberships = list(cm_qs)
-        user_ids = {m.user_id for m in memberships}
-
-        dept_map: dict[str, list[str]] = {}
-        for dm in DepartmentMembership.objects.filter(
-            user_id__in=user_ids,
-            status=DepartmentMembership.Status.ACTIVE,
-        ).select_related("department"):
-            dept_map.setdefault(str(dm.user_id), []).append(dm.department.name)
-
-        team_map: dict[str, list[str]] = {}
-        for tm in TeamMembership.objects.filter(
-            user_id__in=user_ids,
-            status=TeamMembership.Status.ACTIVE,
-        ).select_related("team"):
-            team_map.setdefault(str(tm.user_id), []).append(tm.team.name)
-
-        rel_qs = ReportingRelationship.objects.filter(
-            end_date__isnull=True,
-        ).select_related("company", "employee", "manager")
-        rel_qs = scope_queryset_by_company(rel_qs, request, company_lookup="company_id")
-        if company_id:
-            rel_qs = rel_qs.filter(company_id=company_id)
-
-        active_rels = [
-            r for r in rel_qs if r.employee_id in user_ids and r.manager_id in user_ids
-        ]
-
-        # Build deduplicated employee nodes (preferring the requested company's role)
-        nodes_by_id: dict[str, dict] = {}
-        for m in memberships:
-            uid = str(m.user_id)
-            if uid not in nodes_by_id:
-                nodes_by_id[uid] = {
-                    "id": uid,
-                    "full_name": m.user.full_name,
-                    "email": m.user.email,
-                    "employee_id": m.user.employee_id,
-                    "designation": m.user.designation,
-                    "role": m.role,
-                    "company_id": str(m.company_id),
-                    "company_name": m.company.name,
-                    "company_code": m.company.code,
-                    "departments": dept_map.get(uid, []),
-                    "teams": team_map.get(uid, []),
-                    "manager_id": None,
-                    "relationship_id": None,
-                }
-
-        edges = []
-        for r in active_rels:
-            emp_id = str(r.employee_id)
-            mgr_id = str(r.manager_id)
-            if emp_id in nodes_by_id and nodes_by_id[emp_id]["manager_id"] is None:
-                nodes_by_id[emp_id]["manager_id"] = mgr_id
-                nodes_by_id[emp_id]["relationship_id"] = str(r.id)
-            edges.append(
-                {
-                    "id": str(r.id),
-                    "company_id": str(r.company_id),
-                    "employee_id": emp_id,
-                    "manager_id": mgr_id,
-                    "start_date": r.start_date.isoformat(),
-                }
-            )
-
-        return Response(
-            {
-                "nodes": list(nodes_by_id.values()),
-                "edges": edges,
-            },
-            status=status.HTTP_200_OK,
+        payload, code = build_organization_hierarchy(
+            request.user,
+            company_id=company_id,
+            department_id=department_id,
+            team_id=team_id,
+            search=search,
+            include_inactive=include_inactive,
         )
+        if code == 400:
+            return Response(
+                {"detail": "Invalid UUID filter parameter."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if code != 200:
+            return Response(
+                {"detail": "You are not an active member of this company."},
+                status=code,
+            )
+        return Response(payload, status=status.HTTP_200_OK)
+
+
+class OrganizationHierarchyView(APIView):
+    """
+    GET /api/organization/hierarchy/ and GET /api/hierarchy/
+    Full Organization Hierarchy API (SRS §1.3, §5.3 & §5.4):
+    - Supports ?company=, ?department=, ?team=, ?search=, ?include_inactive=true
+    - Returns summary, structural hierarchy (Company -> Department -> Team -> Employee),
+      reporting tree (CEO -> ... -> Employee), flat nodes, and reporting edges.
+    - Strictly enforces JWT authentication and company-level data isolation.
+    """
+
+    permission_classes = [IsAuthenticated, IsCompanyMember]
+
+    def get(self, request):
+        company_id = request.query_params.get("company") or request.headers.get("X-Company-ID")
+        department_id = request.query_params.get("department")
+        team_id = request.query_params.get("team")
+        search = request.query_params.get("search", "")
+        include_inactive = request.query_params.get("include_inactive", "").lower() in ("true", "1", "yes")
+
+        payload, code = build_organization_hierarchy(
+            request.user,
+            company_id=company_id,
+            department_id=department_id,
+            team_id=team_id,
+            search=search,
+            include_inactive=include_inactive,
+        )
+        if code == 400:
+            return Response(
+                {"detail": "Invalid UUID filter parameter."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if code != 200:
+            return Response(
+                {"detail": "You are not an active member of this company."},
+                status=code,
+            )
+        return Response(payload, status=status.HTTP_200_OK)
+
+
+class OrganizationHierarchyEmployeeDetailView(APIView):
+    """
+    GET /api/organization/hierarchy/employee/<uuid:user_id>/
+    GET /api/hierarchy/employee/<uuid:user_id>/
+    Employee detail panel for Organization Chart (SRS §5.4):
+    - Returns employee profile summary, departments, teams, direct reporting relationships,
+      upward reporting chain, and authorized assigned projects & tasks.
+    """
+
+    permission_classes = [IsAuthenticated, IsCompanyMember]
+
+    def get(self, request, user_id):
+        company_id = request.query_params.get("company") or request.headers.get("X-Company-ID")
+        payload, code = build_hierarchy_employee_detail(
+            request.user,
+            target_user_id=user_id,
+            company_id=company_id,
+        )
+        if code == 400:
+            return Response(
+                {"detail": "Invalid company UUID filter parameter."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if code == 403:
+            return Response(
+                {"detail": "You are not an active member of this company."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if code == 404:
+            return Response(
+                {"detail": "Employee not found within your authorized companies."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(payload, status=status.HTTP_200_OK)

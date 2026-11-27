@@ -1,8 +1,9 @@
 from django.db.models import Avg, Count, Q, Sum
 from django.utils import timezone
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from apps.common.permissions import IsCompanyMemberOrAllowAnyInDev
+from apps.common.permissions import IsActiveUser, IsCompanyMember
 from apps.projects.selectors import get_project_list_queryset
 from apps.tasks.selectors import get_task_list_queryset
 
@@ -15,7 +16,7 @@ class DashboardSummaryView(APIView):
     the same authorization rules as task lists.'
     """
 
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [IsAuthenticated, IsActiveUser, IsCompanyMember]
 
     def get(self, request):
         projects_qs = get_project_list_queryset(request)

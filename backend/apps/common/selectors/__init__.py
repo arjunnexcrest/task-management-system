@@ -1,4 +1,4 @@
-from apps.common.permissions import get_user_company_ids, is_ceo
+from apps.common.permissions import get_user_company_ids, is_ceo, is_user_active
 
 
 def get_active_company_id(request):
@@ -20,12 +20,15 @@ def scope_queryset_by_company(queryset, request, company_lookup="company_id"):
     if request is None:
         return queryset
 
+    user = getattr(request, "user", None)
+    if not is_user_active(user):
+        return queryset.none()
+
     active_company_id = get_active_company_id(request)
     if active_company_id:
         queryset = queryset.filter(**{company_lookup: active_company_id})
 
-    user = getattr(request, "user", None)
-    if user and user.is_authenticated and not is_ceo(user):
+    if not is_ceo(user):
         authorized_company_ids = get_user_company_ids(user)
         if not authorized_company_ids:
             return queryset.none()
