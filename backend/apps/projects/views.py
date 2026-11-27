@@ -2,14 +2,17 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from apps.accounts.models import User
 from apps.common.permissions import (
-    ProjectManagementPermission,
-    ProjectParticipationWritePermission,
-    ProjectPlanningWritePermission,
+    IsActiveUser,
+    IsCompanyMember,
+    get_active_membership,
+    get_user_company_ids,
+    is_ceo,
 )
-from apps.common.selectors import scope_queryset_by_company
 from .filters import ProjectFilterSet, ProjectMilestoneFilterSet, ProjectPhaseFilterSet
 from .models import (
     MilestoneDependency,
@@ -21,7 +24,13 @@ from .models import (
     ProjectPhase,
     ProjectTeam,
 )
-from .selectors import get_project_detail_queryset, get_project_list_queryset
+from .permissions import CanManageProjects
+from .selectors import (
+    get_authorized_project_ids,
+    get_project_detail_queryset,
+    get_project_list_queryset,
+    scope_queryset_by_project,
+)
 from .serializers import (
     MilestoneDependencySerializer,
     MilestoneTaskSerializer,
@@ -52,11 +61,19 @@ from .services import (
 
 
 class ProjectViewSet(viewsets.ModelViewSet):
-    permission_classes = [ProjectManagementPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_class = ProjectFilterSet
     search_fields = ["name", "code", "description", "objectives", "deliverables"]
     ordering_fields = ["start_date", "planned_completion_date", "created_at", "priority", "progress", "name"]
+
+    READ_ACTIONS = (
+        "list",
+        "retrieve",
+        "assignment_hierarchy",
+        "participation",
+        "user_participations",
+        "tasks",
+    )
 
     DETAIL_ACTIONS = (
         "retrieve",
@@ -71,6 +88,11 @@ class ProjectViewSet(viewsets.ModelViewSet):
         "assignment_hierarchy",
         "participation",
     )
+
+    def get_permissions(self):
+        if self.action in self.READ_ACTIONS:
+            return [IsAuthenticated(), IsActiveUser(), IsCompanyMember()]
+        return [IsAuthenticated(), IsActiveUser(), CanManageProjects()]
 
     def get_queryset(self):
         if self.action in self.DETAIL_ACTIONS:
@@ -238,20 +260,39 @@ class ProjectViewSet(viewsets.ModelViewSet):
     def user_participations(self, request):
         """
         SRS §1.3, §3.3, §4.3, §19 & §27.1:
-        Returns all projects in which the specified (or authenticated) employee participates.
+        Returns authorized projects in which the specified (or authenticated) employee participates.
+        Strictly enforces company- and project-level isolation (PERM-04).
         """
-        user_id = request.query_params.get("user") or (
-            str(request.user.id) if getattr(request.user, "is_authenticated", False) else None
-        )
+        user_id = request.query_params.get("user") or str(request.user.id)
         company_id = request.query_params.get("company")
-        if not user_id:
-            return Response(
-                {"error": "Provide ?user=<uuid> or authenticate to view project participations."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        return Response(
-            get_user_project_participations(user_id=user_id, company_id=company_id)
-        )
+
+        if company_id and not is_ceo(request.user):
+            if get_active_membership(request.user, company_id=company_id) is None:
+                return Response(
+                    {"detail": "You are not an active member of this company."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        if not is_ceo(request.user) and str(user_id) != str(request.user.id):
+            requester_cids = get_user_company_ids(request.user)
+            target_user = User.objects.filter(pk=user_id).first()
+            if target_user is None:
+                return Response(
+                    {"detail": "User not found within your authorized companies."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            target_cids = get_user_company_ids(target_user)
+            if not (requester_cids & target_cids):
+                return Response(
+                    {"detail": "You are not authorized to inspect participations for a user outside your company."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        participations = get_user_project_participations(user_id=user_id, company_id=company_id)
+        if not is_ceo(request.user):
+            allowed_pids = {str(pid) for pid in (get_authorized_project_ids(request.user) or set())}
+            participations = [p for p in participations if str(p.get("project_id")) in allowed_pids]
+        return Response(participations)
 
     @action(detail=True, methods=["post"])
     def archive(self, request, pk=None):
@@ -296,13 +337,19 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
 class ProjectMemberViewSet(viewsets.ModelViewSet):
     serializer_class = ProjectMemberSerializer
-    permission_classes = [ProjectParticipationWritePermission]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ["project", "user", "status"]
 
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [IsAuthenticated(), IsActiveUser(), IsCompanyMember()]
+        return [IsAuthenticated(), IsActiveUser(), CanManageProjects()]
+
     def get_queryset(self):
         qs = ProjectMember.objects.select_related("project", "project__company", "user").all()
-        return scope_queryset_by_company(qs, self.request, company_lookup="project__company_id")
+        return scope_queryset_by_project(
+            qs, self.request, project_lookup="project_id", company_lookup="project__company_id"
+        )
 
     def destroy(self, request, *args, **kwargs):
         """
@@ -357,44 +404,66 @@ class ProjectMemberViewSet(viewsets.ModelViewSet):
 
 class ProjectDepartmentViewSet(viewsets.ModelViewSet):
     serializer_class = ProjectDepartmentSerializer
-    permission_classes = [ProjectParticipationWritePermission]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ["project", "department"]
 
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [IsAuthenticated(), IsActiveUser(), IsCompanyMember()]
+        return [IsAuthenticated(), IsActiveUser(), CanManageProjects()]
+
     def get_queryset(self):
         qs = ProjectDepartment.objects.select_related("project", "department").all()
-        return scope_queryset_by_company(qs, self.request, company_lookup="project__company_id")
+        return scope_queryset_by_project(
+            qs, self.request, project_lookup="project_id", company_lookup="project__company_id"
+        )
 
 
 class ProjectTeamViewSet(viewsets.ModelViewSet):
     serializer_class = ProjectTeamSerializer
-    permission_classes = [ProjectParticipationWritePermission]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ["project", "team"]
 
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [IsAuthenticated(), IsActiveUser(), IsCompanyMember()]
+        return [IsAuthenticated(), IsActiveUser(), CanManageProjects()]
+
     def get_queryset(self):
         qs = ProjectTeam.objects.select_related("project", "team", "team__department").all()
-        return scope_queryset_by_company(qs, self.request, company_lookup="project__company_id")
+        return scope_queryset_by_project(
+            qs, self.request, project_lookup="project_id", company_lookup="project__company_id"
+        )
 
 
 class ProjectPhaseViewSet(viewsets.ModelViewSet):
     serializer_class = ProjectPhaseSerializer
-    permission_classes = [ProjectPlanningWritePermission]
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_class = ProjectPhaseFilterSet
     ordering_fields = ["start_date", "end_date", "progress", "name"]
 
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [IsAuthenticated(), IsActiveUser(), IsCompanyMember()]
+        return [IsAuthenticated(), IsActiveUser(), CanManageProjects()]
+
     def get_queryset(self):
         qs = ProjectPhase.objects.select_related("project", "owner").all()
-        return scope_queryset_by_company(qs, self.request, company_lookup="project__company_id")
+        return scope_queryset_by_project(
+            qs, self.request, project_lookup="project_id", company_lookup="project__company_id"
+        )
 
 
 class ProjectMilestoneViewSet(viewsets.ModelViewSet):
     serializer_class = ProjectMilestoneSerializer
-    permission_classes = [ProjectPlanningWritePermission]
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_class = ProjectMilestoneFilterSet
     ordering_fields = ["target_date", "progress", "title"]
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [IsAuthenticated(), IsActiveUser(), IsCompanyMember()]
+        return [IsAuthenticated(), IsActiveUser(), CanManageProjects()]
 
     def get_queryset(self):
         qs = (
@@ -402,7 +471,9 @@ class ProjectMilestoneViewSet(viewsets.ModelViewSet):
             .prefetch_related("milestone_tasks__task", "dependencies__depends_on_milestone")
             .all()
         )
-        return scope_queryset_by_company(qs, self.request, company_lookup="project__company_id")
+        return scope_queryset_by_project(
+            qs, self.request, project_lookup="project_id", company_lookup="project__company_id"
+        )
 
     @action(detail=True, methods=["post"])
     def complete(self, request, pk=None):
@@ -422,13 +493,22 @@ class ProjectMilestoneViewSet(viewsets.ModelViewSet):
 
 class MilestoneTaskViewSet(viewsets.ModelViewSet):
     serializer_class = MilestoneTaskSerializer
-    permission_classes = [ProjectPlanningWritePermission]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ["milestone", "task"]
 
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [IsAuthenticated(), IsActiveUser(), IsCompanyMember()]
+        return [IsAuthenticated(), IsActiveUser(), CanManageProjects()]
+
     def get_queryset(self):
         qs = MilestoneTask.objects.select_related("milestone__project", "task").all()
-        return scope_queryset_by_company(qs, self.request, company_lookup="milestone__project__company_id")
+        return scope_queryset_by_project(
+            qs,
+            self.request,
+            project_lookup="milestone__project_id",
+            company_lookup="milestone__project__company_id",
+        )
 
     def perform_create(self, serializer):
         instance = serializer.save()
@@ -442,10 +522,19 @@ class MilestoneTaskViewSet(viewsets.ModelViewSet):
 
 class MilestoneDependencyViewSet(viewsets.ModelViewSet):
     serializer_class = MilestoneDependencySerializer
-    permission_classes = [ProjectPlanningWritePermission]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ["milestone", "depends_on_milestone"]
 
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [IsAuthenticated(), IsActiveUser(), IsCompanyMember()]
+        return [IsAuthenticated(), IsActiveUser(), CanManageProjects()]
+
     def get_queryset(self):
         qs = MilestoneDependency.objects.select_related("milestone__project", "depends_on_milestone").all()
-        return scope_queryset_by_company(qs, self.request, company_lookup="milestone__project__company_id")
+        return scope_queryset_by_project(
+            qs,
+            self.request,
+            project_lookup="milestone__project_id",
+            company_lookup="milestone__project__company_id",
+        )

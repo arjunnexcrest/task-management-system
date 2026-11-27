@@ -341,11 +341,13 @@ def check_attachment_access_permission(attachment: Attachment, user: User | None
     """
     SRS §7.8 & §27.5: Permission-controlled download & delete check.
     Verifies that an authenticated user belongs to at least one company associated with
-    the attachment (or is the uploader / superuser).
+    the attachment (or is the uploader / CEO / superuser).
     """
+    from apps.common.permissions import is_ceo
+
     if user is None or not getattr(user, "is_authenticated", False):
         return
-    if getattr(user, "is_superuser", False) or attachment.uploaded_by_id == user.id:
+    if is_ceo(user) or attachment.uploaded_by_id == user.id:
         return
 
     companies = set()
@@ -360,10 +362,15 @@ def check_attachment_access_permission(attachment: Attachment, user: User | None
         return
 
     for comp in companies:
+        if not getattr(comp, "is_active", True):
+            continue
         if getattr(comp, "company_incharge_id", None) == user.id:
             return
         if CompanyMembership.objects.filter(
-            company=comp, user=user, status=CompanyMembership.Status.ACTIVE
+            company=comp,
+            user=user,
+            is_active=True,
+            status=CompanyMembership.Status.ACTIVE,
         ).exists():
             return
 

@@ -193,11 +193,13 @@ class TimeEntrySerializer(CompanyScopedValidationMixin, serializers.ModelSeriali
         ]
         read_only_fields = ["id", "created_at"]
         extra_kwargs = {"user": {"required": False}}
+        validators = []
 
     def validate(self, attrs):
         started_at = attrs.get("started_at")
         ended_at = attrs.get("ended_at")
         duration = attrs.get("duration_minutes", 0)
+        entry_type = attrs.get("entry_type", getattr(self.instance, "entry_type", TimeEntry.EntryType.MANUAL))
         task = attrs.get("task") or getattr(self.instance, "task", None)
         user = attrs.get("user") or getattr(self.instance, "user", None)
 
@@ -207,4 +209,19 @@ class TimeEntrySerializer(CompanyScopedValidationMixin, serializers.ModelSeriali
             raise serializers.ValidationError({"duration_minutes": "Duration cannot be negative (DB Design §5)."})
         if started_at and ended_at and ended_at <= started_at:
             raise serializers.ValidationError({"ended_at": "Ended time must be after start time (DB Design §5)."})
+
+        request = self.context.get("request")
+        target_user = attrs.get("user") or getattr(self.instance, "user", None) or (
+            request.user if request and getattr(request.user, "is_authenticated", False) else None
+        )
+        if entry_type == TimeEntry.EntryType.TIMER and ended_at is None and target_user is not None:
+            active_qs = TimeEntry.objects.filter(
+                user=target_user, entry_type=TimeEntry.EntryType.TIMER, ended_at__isnull=True
+            )
+            if self.instance:
+                active_qs = active_qs.exclude(pk=self.instance.pk)
+            if active_qs.exists():
+                raise serializers.ValidationError(
+                    {"entry_type": "User already has an active running timer (DB Design §4.6)."}
+                )
         return attrs

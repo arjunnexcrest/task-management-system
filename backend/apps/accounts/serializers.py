@@ -936,8 +936,19 @@ class UserSerializer(serializers.ModelSerializer):
         company_id = validated_data.pop("company", None)
         role = validated_data.pop("role", None)
 
-        if role is not None and request and not is_ceo(request.user):
-            raise PermissionDenied("Only the CEO can change user roles.")
+        if request and not is_ceo(request.user):
+            privileged_attempted = (
+                role is not None
+                or company_id is not None
+                or any(
+                    field in validated_data
+                    for field in ("is_staff", "is_active", "account_status", "is_superuser")
+                )
+            )
+            if privileged_attempted:
+                raise PermissionDenied(
+                    "Only the CEO can change user roles, company assignments, staff flags, or account status."
+                )
 
         password = validated_data.pop("password", None)
         if "username" in validated_data and not validated_data["username"]:

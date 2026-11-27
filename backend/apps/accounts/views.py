@@ -38,14 +38,8 @@ class UserFilter(django_filters.FilterSet):
     company = django_filters.UUIDFilter(method="filter_by_company")
     company_id = django_filters.UUIDFilter(method="filter_by_company")
     role = django_filters.CharFilter(method="filter_by_role")
-    department_id = django_filters.UUIDFilter(
-        field_name="department_memberships__department_id",
-        distinct=True,
-    )
-    team_id = django_filters.UUIDFilter(
-        field_name="team_memberships__team_id",
-        distinct=True,
-    )
+    department_id = django_filters.UUIDFilter(method="filter_by_department")
+    team_id = django_filters.UUIDFilter(method="filter_by_team")
 
     class Meta:
         model = User
@@ -64,6 +58,18 @@ class UserFilter(django_filters.FilterSet):
         return queryset.filter(
             company_memberships__company_id=value,
             company_memberships__is_active=True,
+        ).distinct()
+
+    def filter_by_department(self, queryset, name, value):
+        return queryset.filter(
+            department_memberships__department_id=value,
+            department_memberships__status="Active",
+        ).distinct()
+
+    def filter_by_team(self, queryset, name, value):
+        return queryset.filter(
+            team_memberships__team_id=value,
+            team_memberships__status="Active",
         ).distinct()
 
     def filter_by_role(self, queryset, name, value):
@@ -231,6 +237,10 @@ class UserViewSet(viewsets.ModelViewSet):
             return [IsAuthenticated(), IsActiveUser()]
         if self.action in ("list", "retrieve", "direct_reports", "reporting_chain"):
             return [IsAuthenticated(), IsActiveUser(), IsCompanyMember()]
+        if self.action == "companies":
+            if self.request.method == "POST":
+                return [IsAuthenticated(), IsActiveUser(), IsCEO()]
+            return [IsAuthenticated(), IsActiveUser(), IsCompanyMember()]
         if self.action == "profile":
             if self.request.method in ("PATCH", "PUT"):
                 return [IsAuthenticated(), IsActiveUser(), IsCEOOrSelf()]
@@ -359,6 +369,8 @@ class UserViewSet(viewsets.ModelViewSet):
         qs = ReportingRelationship.objects.filter(
             manager=manager, end_date__isnull=True
         ).select_related("employee", "company")
+        if not is_ceo(request.user):
+            qs = qs.filter(company_id__in=get_user_company_ids(request.user))
         company_id = request.query_params.get("company")
         if company_id:
             qs = qs.filter(company_id=company_id)
@@ -385,6 +397,7 @@ class UserViewSet(viewsets.ModelViewSet):
 
         employee = self.get_object()
         company_id = request.query_params.get("company")
+        allowed_cids = None if is_ceo(request.user) else get_user_company_ids(request.user)
         chain = []
         visited = {employee.id}
         curr_id = employee.id
@@ -393,6 +406,8 @@ class UserViewSet(viewsets.ModelViewSet):
             qs = ReportingRelationship.objects.filter(
                 employee_id=curr_id, end_date__isnull=True
             ).select_related("manager", "company")
+            if allowed_cids is not None:
+                qs = qs.filter(company_id__in=allowed_cids)
             if company_id:
                 qs = qs.filter(company_id=company_id)
             rel = qs.order_by("-start_date").first()
@@ -423,9 +438,11 @@ class UserViewSet(viewsets.ModelViewSet):
             the active reporting manager while preserving historical records.
         DELETE /api/employees/<id>/reporting-manager/?company=<uuid> — End active reporting manager.
         """
+        from apps.common.permissions import user_has_any_role
         from apps.companies.models import CompanyMembership
         from apps.organization.models import ReportingRelationship
         from apps.organization.serializers import ReportingRelationshipSerializer
+        from apps.rbac.roles import SystemRole
 
         employee = self.get_object()
 
@@ -433,6 +450,8 @@ class UserViewSet(viewsets.ModelViewSet):
             qs = ReportingRelationship.objects.filter(
                 employee=employee, end_date__isnull=True
             ).select_related("company", "employee", "manager")
+            if not is_ceo(request.user):
+                qs = qs.filter(company_id__in=get_user_company_ids(request.user))
             company_id = request.query_params.get("company")
             if company_id:
                 qs = qs.filter(company_id=company_id)
@@ -457,6 +476,14 @@ class UserViewSet(viewsets.ModelViewSet):
                     {"company": ["Provide 'company' UUID to identify which company's reporting manager to update."]},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+
+        if not user_has_any_role(
+            request.user, [SystemRole.CEO, SystemRole.COMPANY_IN_CHARGE], company_id=company_id
+        ):
+            return Response(
+                {"detail": "Only the CEO or Company In-Charge of this company can manage reporting relationships."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         if request.method == "DELETE" or (
             "manager" in request.data and request.data.get("manager") in (None, "")
@@ -495,4 +522,39 @@ class UserViewSet(viewsets.ModelViewSet):
         return Response(
             ReportingRelationshipSerializer(relationship).data,
             status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=True, methods=["get", "post"], url_path="companies")
+    def companies(self, request, pk=None):
+        """
+        GET /api/employees/<id>/companies/ — List this employee's company memberships
+            (CEO sees all; non-CEO sees only memberships in companies they also belong to).
+        POST /api/employees/<id>/companies/ — Add this employee to a company with a role (CEO-only).
+        """
+        from apps.companies.models import CompanyMembership
+        from apps.companies.serializers import CompanyMembershipSerializer
+
+        employee = self.get_object()
+        if request.method == "POST":
+            payload = dict(request.data)
+            payload["user"] = str(employee.id)
+            serializer = CompanyMembershipSerializer(data=payload, context={"request": request})
+            serializer.is_valid(raise_exception=True)
+            membership = serializer.save()
+            return Response(
+                CompanyMembershipSerializer(membership, context={"request": request}).data,
+                status=status.HTTP_201_CREATED,
+            )
+
+        qs = (
+            CompanyMembership.objects.filter(user=employee)
+            .select_related("company", "user")
+            .order_by("-is_active", "-joined_at")
+        )
+        if not is_ceo(request.user):
+            cids = get_user_company_ids(request.user)
+            qs = qs.filter(company_id__in=cids)
+        return Response(
+            CompanyMembershipSerializer(qs, many=True, context={"request": request}).data,
+            status=status.HTTP_200_OK,
         )

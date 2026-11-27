@@ -3,6 +3,8 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     DepartmentMembershipViewSet,
     DepartmentViewSet,
+    OrganizationHierarchyEmployeeDetailView,
+    OrganizationHierarchyView,
     ReportingRelationshipViewSet,
     TeamMembershipViewSet,
     TeamViewSet,
@@ -51,7 +53,23 @@ reporting_only_urlpatterns = [
     path("", include(reporting_only_router.urls)),
 ]
 
+# Standalone routes for mounting directly at /api/hierarchy/
+hierarchy_only_urlpatterns = [
+    path("", OrganizationHierarchyView.as_view(), name="hierarchy-api"),
+    path(
+        "employee/<uuid:user_id>/",
+        OrganizationHierarchyEmployeeDetailView.as_view(),
+        name="hierarchy-api-employee-detail",
+    ),
+]
+
 urlpatterns = [
+    path("hierarchy/", OrganizationHierarchyView.as_view(), name="organization-hierarchy"),
+    path(
+        "hierarchy/employee/<uuid:user_id>/",
+        OrganizationHierarchyEmployeeDetailView.as_view(),
+        name="organization-hierarchy-employee-detail",
+    ),
     path(
         "departments/<uuid:pk>/assign-head/",
         DepartmentViewSet.as_view({"post": "assign_head"}),

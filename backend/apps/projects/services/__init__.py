@@ -612,7 +612,7 @@ def get_project_assignment_hierarchy(*, project: Project) -> dict:
                 "designation": tm.user.designation,
             }
 
-    # Multi-project participation lookup for all members of this project (SRS §1.3 & §27.1)
+    # Multi-project participation lookup for all members of this project within the same company (SRS §1.3 & §4.3)
     member_user_ids = [pm.user_id for pm in project_members_qs]
     other_projects_by_user: dict[str, list] = {}
     if member_user_ids:
@@ -620,6 +620,7 @@ def get_project_assignment_hierarchy(*, project: Project) -> dict:
             ProjectMember.objects.filter(
                 user_id__in=member_user_ids,
                 status=ProjectMember.Status.ACTIVE,
+                project__company_id=project.company_id,
             )
             .exclude(project=project)
             .select_related("project")

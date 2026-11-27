@@ -3,16 +3,14 @@ from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from apps.accounts.models import User
-from apps.common.permissions import (
-    IsCompanyMemberOrAllowAnyInDev,
-    ROLE_DELIVERY_LEADS,
-    user_has_any_role,
-)
-from apps.common.selectors import scope_queryset_by_company
+from apps.common.permissions import IsActiveUser, IsCompanyMember, is_ceo
 from apps.tasks.models import Task
+from apps.tasks.permissions import user_is_task_manager
+from apps.tasks.selectors import get_authorized_task_ids, scope_queryset_by_task
 from .filters import ProgressUpdateFilterSet, TimeEntryFilterSet
 from .models import ProgressAttachment, ProgressUpdate, TimeEntry
 from .serializers import (
@@ -23,15 +21,17 @@ from .serializers import (
 from .services import get_work_log_review_summary_service
 
 
-def _default_user(request):
-    if request and getattr(request, "user", None) and request.user.is_authenticated:
-        return request.user
-    return User.objects.first()
+def _ensure_task_authorized(user, task):
+    if is_ceo(user):
+        return
+    allowed = get_authorized_task_ids(user) or set()
+    if task.id not in allowed:
+        raise PermissionDenied("You do not have access to this task.")
 
 
 class ProgressUpdateViewSet(viewsets.ModelViewSet):
     serializer_class = ProgressUpdateSerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [IsAuthenticated, IsActiveUser, IsCompanyMember]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_class = ProgressUpdateFilterSet
     search_fields = [
@@ -51,20 +51,37 @@ class ProgressUpdateViewSet(viewsets.ModelViewSet):
             .prefetch_related("progress_attachments__attachment__uploaded_by")
             .order_by("-created_at")
         )
-        return scope_queryset_by_company(qs, self.request, company_lookup="task__project__company_id")
+        return scope_queryset_by_task(
+            qs, self.request, task_lookup="task_id", company_lookup="task__project__company_id"
+        )
 
     def perform_create(self, serializer):
-        if "author" not in serializer.validated_data:
-            task = serializer.validated_data.get("task")
-            author = _default_user(self.request)
-            if (
-                not (self.request and getattr(self.request, "user", None) and self.request.user.is_authenticated)
-                and task is not None
-            ):
-                author = task.task_owner or task.created_by or author
-            serializer.save(author=author)
-        else:
-            serializer.save()
+        task = serializer.validated_data["task"]
+        _ensure_task_authorized(self.request.user, task)
+        is_mgr = user_is_task_manager(self.request.user, task)
+        supplied_author = serializer.validated_data.get("author")
+        if not is_mgr and supplied_author is not None and supplied_author.pk != self.request.user.pk:
+            raise PermissionDenied("You cannot log progress updates on behalf of another user.")
+        author = supplied_author if (is_mgr and supplied_author is not None) else self.request.user
+        serializer.save(author=author)
+
+    def perform_update(self, serializer):
+        instance = serializer.instance
+        is_mgr = user_is_task_manager(self.request.user, instance.task)
+        if instance.author_id != self.request.user.id and not is_mgr:
+            raise PermissionDenied("You can only edit your own progress updates.")
+        if not is_mgr:
+            supplied_author = serializer.validated_data.get("author")
+            if supplied_author is not None and supplied_author.pk != self.request.user.pk:
+                raise PermissionDenied("You cannot reassign progress update authorship.")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        if instance.author_id != self.request.user.id and not user_is_task_manager(
+            self.request.user, instance.task
+        ):
+            raise PermissionDenied("You can only delete your own progress updates.")
+        instance.delete()
 
     @action(detail=False, methods=["get"])
     def summary(self, request):
@@ -80,42 +97,122 @@ class ProgressUpdateViewSet(viewsets.ModelViewSet):
 
 class ProgressAttachmentViewSet(viewsets.ModelViewSet):
     serializer_class = ProgressAttachmentSerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [IsAuthenticated, IsActiveUser, IsCompanyMember]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ["progress_update", "attachment"]
 
     def get_queryset(self):
         qs = ProgressAttachment.objects.select_related(
-            "progress_update", "progress_update__task__project", "attachment", "attachment__uploaded_by"
+            "progress_update",
+            "progress_update__task",
+            "progress_update__task__project",
+            "attachment",
+            "attachment__uploaded_by",
         ).all()
-        return scope_queryset_by_company(
-            qs, self.request, company_lookup="progress_update__task__project__company_id"
+        return scope_queryset_by_task(
+            qs,
+            self.request,
+            task_lookup="progress_update__task_id",
+            company_lookup="progress_update__task__project__company_id",
         )
+
+    def perform_create(self, serializer):
+        progress_update = serializer.validated_data["progress_update"]
+        _ensure_task_authorized(self.request.user, progress_update.task)
+        if progress_update.author_id != self.request.user.id and not user_is_task_manager(
+            self.request.user, progress_update.task
+        ):
+            raise PermissionDenied("You can only attach files to your own progress updates.")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        pu = instance.progress_update
+        if pu.author_id != self.request.user.id and not user_is_task_manager(self.request.user, pu.task):
+            raise PermissionDenied("You can only remove attachments from your own progress updates.")
+        instance.delete()
 
 
 class TimeEntryViewSet(viewsets.ModelViewSet):
     serializer_class = TimeEntrySerializer
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [IsAuthenticated, IsActiveUser, IsCompanyMember]
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_class = TimeEntryFilterSet
     ordering_fields = ["started_at", "created_at", "duration_minutes"]
 
     def get_queryset(self):
         qs = TimeEntry.objects.select_related("task", "task__project", "user", "approved_by").order_by("-created_at")
-        return scope_queryset_by_company(qs, self.request, company_lookup="task__project__company_id")
+        return scope_queryset_by_task(
+            qs, self.request, task_lookup="task_id", company_lookup="task__project__company_id"
+        )
 
     def perform_create(self, serializer):
-        if "user" not in serializer.validated_data:
-            serializer.save(user=_default_user(self.request))
+        task = serializer.validated_data["task"]
+        _ensure_task_authorized(self.request.user, task)
+        is_mgr = user_is_task_manager(self.request.user, task)
+
+        supplied_user = serializer.validated_data.get("user")
+        approval_status = serializer.validated_data.get("approval_status", TimeEntry.ApprovalStatus.PENDING)
+        approved_by = serializer.validated_data.get("approved_by")
+
+        if not is_mgr:
+            if supplied_user is not None and supplied_user.pk != self.request.user.pk:
+                raise PermissionDenied("You can only log time entries for yourself.")
+            if approval_status != TimeEntry.ApprovalStatus.PENDING or approved_by is not None:
+                raise PermissionDenied("Only managers can approve or reject time entries.")
+            serializer.save(
+                user=self.request.user,
+                approval_status=TimeEntry.ApprovalStatus.PENDING,
+                approved_by=None,
+            )
+            return
+
+        target_user = supplied_user or self.request.user
+        if (
+            approval_status in (TimeEntry.ApprovalStatus.APPROVED, TimeEntry.ApprovalStatus.REJECTED)
+            and approved_by is None
+        ):
+            approved_by = self.request.user
+        serializer.save(user=target_user, approved_by=approved_by)
+
+    def perform_update(self, serializer):
+        instance = serializer.instance
+        is_mgr = user_is_task_manager(self.request.user, instance.task)
+        if instance.user_id != self.request.user.id and not is_mgr:
+            raise PermissionDenied("You can only edit your own time entries.")
+
+        if not is_mgr:
+            supplied_user = serializer.validated_data.get("user")
+            if supplied_user is not None and supplied_user.pk != self.request.user.pk:
+                raise PermissionDenied("You cannot reassign a time entry to another user.")
+            new_status = serializer.validated_data.get("approval_status")
+            if (
+                (new_status is not None and new_status != instance.approval_status)
+                or "approved_by" in serializer.validated_data
+            ):
+                raise PermissionDenied("Only managers can approve or reject time entries.")
+            serializer.save()
+            return
+
+        new_status = serializer.validated_data.get("approval_status")
+        if (
+            new_status in (TimeEntry.ApprovalStatus.APPROVED, TimeEntry.ApprovalStatus.REJECTED)
+            and "approved_by" not in serializer.validated_data
+        ):
+            serializer.save(approved_by=self.request.user)
         else:
             serializer.save()
+
+    def perform_destroy(self, instance):
+        if instance.user_id != self.request.user.id and not user_is_task_manager(
+            self.request.user, instance.task
+        ):
+            raise PermissionDenied("You can only delete your own time entries.")
+        instance.delete()
 
     @action(detail=False, methods=["get"], url_path="active-timer")
     def active_timer(self, request):
         """Returns the caller's currently running timer entry (if any)."""
-        actor = _default_user(request)
-        if not actor:
-            return Response({"active_timer": None})
+        actor = request.user
         timer = (
             self.get_queryset()
             .filter(user=actor, entry_type=TimeEntry.EntryType.TIMER, ended_at__isnull=True)
@@ -131,9 +228,9 @@ class TimeEntryViewSet(viewsets.ModelViewSet):
         SRS §9.2 & DB Design §4.6:
         Starts a live timer on a task. Enforces one active timer per employee (`uq_active_timer_per_user`).
         """
-        actor = _default_user(request)
+        actor = request.user
         task_id = request.data.get("task")
-        if not actor or not task_id:
+        if not task_id:
             return Response(
                 {"error": "A valid `task` UUID is required to start a timer."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -153,13 +250,14 @@ class TimeEntryViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        task = scope_queryset_by_company(
+        task = scope_queryset_by_task(
             Task.objects.select_related("project"),
             request,
+            task_lookup="id",
             company_lookup="project__company_id",
         ).filter(id=task_id).first()
         if not task:
-            return Response({"error": "Task not found in your authorized company scope."}, status=status.HTTP_404_NOT_FOUND)
+            return Response({"error": "Task not found in your authorized scope."}, status=status.HTTP_404_NOT_FOUND)
 
         entry = TimeEntry.objects.create(
             task=task,
@@ -174,10 +272,7 @@ class TimeEntryViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=["post"], url_path="stop-timer")
     def stop_timer(self, request):
         """Stops the caller's active timer and records elapsed duration_minutes (minimum 1m)."""
-        actor = _default_user(request)
-        if not actor:
-            return Response({"error": "User not resolved."}, status=status.HTTP_400_BAD_REQUEST)
-
+        actor = request.user
         timer = TimeEntry.objects.filter(
             user=actor,
             entry_type=TimeEntry.EntryType.TIMER,
@@ -199,13 +294,12 @@ class TimeEntryViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"])
     def approve(self, request, pk=None):
         """Allows a manager/lead to approve or reject a time entry."""
-        if request.user and request.user.is_authenticated:
-            if not user_has_any_role(request.user, ROLE_DELIVERY_LEADS):
-                return Response(
-                    {"detail": "Only Team Leaders, Department Heads, Project Managers, or Executives can approve time entries."},
-                    status=status.HTTP_403_FORBIDDEN,
-                )
         entry = self.get_object()
+        if not user_is_task_manager(request.user, entry.task):
+            return Response(
+                {"detail": "Only Team Leaders, Department Heads, Project Managers, or Executives can approve time entries."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         decision = request.data.get("approval_status", TimeEntry.ApprovalStatus.APPROVED)
         if decision not in (
             TimeEntry.ApprovalStatus.APPROVED,
@@ -214,6 +308,6 @@ class TimeEntryViewSet(viewsets.ModelViewSet):
         ):
             return Response({"error": "Invalid approval_status."}, status=status.HTTP_400_BAD_REQUEST)
         entry.approval_status = decision
-        entry.approved_by = _default_user(request)
+        entry.approved_by = request.user
         entry.save(update_fields=["approval_status", "approved_by"])
         return Response(TimeEntrySerializer(entry).data, status=status.HTTP_200_OK)

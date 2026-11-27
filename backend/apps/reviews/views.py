@@ -3,18 +3,26 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import MethodNotAllowed, PermissionDenied as DrfPermissionDenied
+from rest_framework.exceptions import MethodNotAllowed, PermissionDenied
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from apps.accounts.models import User
-from apps.common.permissions import ReviewManagementPermission
+from apps.common.permissions import (
+    ROLE_PROJECT_LEADERS,
+    IsActiveUser,
+    IsCompanyMember,
+    get_company_id_from_request,
+    is_ceo,
+    user_has_any_role,
+)
 from apps.companies.models import Company
 from apps.projects.models import Project
 from apps.tasks.models import Task
-from apps.tasks.selectors import get_task_detail_queryset
+from apps.tasks.selectors import get_task_detail_queryset, scope_queryset_by_task
 from .filters import TaskReviewFilterSet
 from .models import TaskReview
+from .permissions import CanReviewTasks, validate_can_review_task
 from .selectors import (
     get_review_analytics_summary,
     get_review_list_queryset,
@@ -33,59 +41,58 @@ from .services import (
 )
 
 
-def _resolve_actor(request, task=None, fallback_reviewer=None):
-    if request and getattr(request, "user", None) and request.user.is_authenticated:
-        return request.user
-    if fallback_reviewer is not None:
-        return fallback_reviewer
-    if task is not None:
-        return task.reviewer or task.project.project_manager or task.created_by
-    return User.objects.first()
-
-
 class TaskReviewViewSet(viewsets.ModelViewSet):
     """
     SRS Module 12 (§14.1–§14.4) & DB Design §4.6, §5, §8:
     Manages review queues, configurable approval chains, approval/rejection/correction decisions,
     reviewer reassignment, reference document attachments, and review SLA escalations.
-    Historical reviews are preserved non-destructively (DELETE disabled).
+    Historical reviews are preserved non-destructively (PUT/PATCH/DELETE disabled).
     """
 
     serializer_class = TaskReviewSerializer
-    permission_classes = [ReviewManagementPermission]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_class = TaskReviewFilterSet
     search_fields = ["task__title", "task__project__code", "comments", "correction_reason", "reviewer__full_name"]
     ordering_fields = ["reviewed_at", "review_round"]
 
+    def get_permissions(self):
+        if self.action in ("list", "retrieve", "queue", "summary", "submit"):
+            return [IsAuthenticated(), IsActiveUser(), IsCompanyMember()]
+        if self.action == "approval_chain":
+            if self.request.method == "GET":
+                return [IsAuthenticated(), IsActiveUser(), IsCompanyMember()]
+            return [IsAuthenticated(), IsActiveUser(), IsCompanyMember()]
+        if self.action in ("update", "partial_update", "destroy"):
+            return [IsAuthenticated(), IsActiveUser(), IsCompanyMember()]
+        return [IsAuthenticated(), IsActiveUser(), CanReviewTasks()]
+
     def get_queryset(self):
-        return get_review_list_queryset(self.request)
+        qs = get_review_list_queryset(self.request)
+        return scope_queryset_by_task(
+            qs, self.request, task_lookup="task_id", company_lookup="task__project__company_id"
+        )
 
     def get_serializer_context(self):
         ctx = super().get_serializer_context()
         if self.request:
-            is_auth = bool(getattr(self.request, "user", None) and self.request.user.is_authenticated)
-            ctx["enforce_actor_permission"] = is_auth
+            ctx["enforce_actor_permission"] = True
             uploaded = self.request.FILES.getlist("files") or self.request.FILES.getlist("file")
             if uploaded:
                 ctx["uploaded_files"] = uploaded
         return ctx
 
     def perform_create(self, serializer):
-        task = serializer.validated_data.get("task")
-        if "reviewer" not in serializer.validated_data:
-            actor = _resolve_actor(self.request, task=task)
-            serializer.save(reviewer=actor)
+        task = serializer.validated_data["task"]
+        validate_can_review_task(self.request.user, task)
+        if is_ceo(self.request.user):
+            reviewer = serializer.validated_data.get("reviewer") or self.request.user
         else:
-            if self.request and getattr(self.request, "user", None) and self.request.user.is_authenticated:
-                # Authenticated caller cannot spoof another reviewer unless superuser
-                explicit_rev = serializer.validated_data["reviewer"]
-                if not self.request.user.is_superuser and explicit_rev.id != self.request.user.id:
-                    raise DrfPermissionDenied(
-                        "Authenticated reviewers cannot submit decisions on behalf of another user."
-                    )
-            serializer.save()
+            supplied = serializer.validated_data.get("reviewer")
+            if supplied is not None and supplied.pk != self.request.user.pk:
+                raise PermissionDenied("You cannot submit a review on behalf of another user.")
+            reviewer = self.request.user
+        serializer.save(reviewer=reviewer)
 
     def update(self, request, *args, **kwargs):
         raise MethodNotAllowed(
@@ -151,15 +158,7 @@ class TaskReviewViewSet(viewsets.ModelViewSet):
         if not task:
             return Response({"error": "Valid `task` UUID is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-        actor_id = request.data.get("actor")
-        actor = None
-        if request.user and request.user.is_authenticated:
-            actor = request.user
-        elif actor_id:
-            actor = User.objects.filter(id=actor_id).first()
-        else:
-            actor = task.task_owner or task.created_by
-
+        actor = request.user
         attachment_ids = request.data.get("attachment_ids")
         if isinstance(attachment_ids, str):
             attachment_ids = [s.strip() for s in attachment_ids.split(",") if s.strip()]
@@ -222,14 +221,8 @@ class TaskReviewViewSet(viewsets.ModelViewSet):
         if not task:
             return Response({"error": "Valid `task` UUID is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-        is_auth = bool(request.user and request.user.is_authenticated)
-        if is_auth:
-            reviewer = request.user
-        else:
-            rev_id = request.data.get("reviewer")
-            reviewer = User.objects.filter(id=rev_id).first() if rev_id else None
-            if not reviewer:
-                reviewer = task.reviewer or task.project.project_manager or task.created_by
+        validate_can_review_task(request.user, task)
+        reviewer = request.user
 
         attachment_ids = request.data.get("attachment_ids")
         if isinstance(attachment_ids, str):
@@ -248,7 +241,7 @@ class TaskReviewViewSet(viewsets.ModelViewSet):
                 correction_reason=request.data.get("correction_reason"),
                 attachment_ids=attachment_ids,
                 uploaded_files=uploaded_files,
-                enforce_actor_permission=is_auth,
+                enforce_actor_permission=True,
             )
         except DjangoPermissionDenied as exc:
             return Response({"error": str(exc)}, status=status.HTTP_403_FORBIDDEN)
@@ -256,7 +249,9 @@ class TaskReviewViewSet(viewsets.ModelViewSet):
             msg = exc.messages[0] if hasattr(exc, "messages") else str(exc)
             return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
 
-        refreshed = self.get_queryset().get(pk=review.pk)
+        refreshed = self.get_queryset().filter(pk=review.pk).first() or (
+            get_review_list_queryset(request).filter(pk=review.pk).first() or review
+        )
         return Response(TaskReviewSerializer(refreshed).data, status=status.HTTP_201_CREATED)
 
     @action(detail=False, methods=["post"], url_path="reassign-reviewer")
@@ -269,20 +264,13 @@ class TaskReviewViewSet(viewsets.ModelViewSet):
         if not task:
             return Response({"error": "Valid `task` UUID is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-        is_auth = bool(request.user and request.user.is_authenticated)
-        actor = request.user if is_auth else (
-            User.objects.filter(id=request.data.get("actor")).first()
-            if request.data.get("actor")
-            else (task.project.project_manager or task.reviewer or task.created_by)
-        )
-
         try:
             updated_task = reassign_reviewer_service(
                 task=task,
                 new_reviewer_id=request.data.get("new_reviewer") or request.data.get("reviewer"),
-                actor=actor,
+                actor=request.user,
                 reason=request.data.get("reason"),
-                enforce_actor_permission=is_auth,
+                enforce_actor_permission=True,
             )
         except DjangoPermissionDenied as exc:
             return Response({"error": str(exc)}, status=status.HTTP_403_FORBIDDEN)
@@ -298,7 +286,7 @@ class TaskReviewViewSet(viewsets.ModelViewSet):
         """
         SRS §14.1 & §20.2:
         GET: Retrieves active approval chain configuration for a task, project, or company.
-        POST: Configures company/project/task approval chains and escalation intervals.
+        POST: Configures company/project/task approval chains and escalation intervals (PM/Admin/CEO).
         """
         if request.method == "GET":
             task_id = request.query_params.get("task")
@@ -325,18 +313,30 @@ class TaskReviewViewSet(viewsets.ModelViewSet):
                 }
             )
 
-        # POST
-        scope = request.data.get("scope", "company")
+        # POST: restricted to CEO / CompanyInCharge / ProjectManager
+        target_company_id = get_company_id_from_request(request)
         task = Task.objects.select_related("project", "project__company").filter(id=request.data.get("task")).first() if request.data.get("task") else None
         project = Project.objects.select_related("company").filter(id=request.data.get("project")).first() if request.data.get("project") else None
         company = Company.objects.filter(id=request.data.get("company")).first() if request.data.get("company") else None
-        actor = request.user if (request.user and request.user.is_authenticated) else None
 
+        resolved_cid = (
+            (task.project.company_id if task else None)
+            or (project.company_id if project else None)
+            or (company.id if company else None)
+            or target_company_id
+        )
+        if not user_has_any_role(request.user, ROLE_PROJECT_LEADERS, company_id=resolved_cid):
+            return Response(
+                {"detail": "Only CEO, Company In-Charge, or Project Manager can configure approval chains."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        scope = request.data.get("scope", "company")
         try:
             result = configure_approval_chain_service(
                 scope=scope,
                 levels=request.data.get("levels", ["Reviewer"]),
-                actor=actor,
+                actor=request.user,
                 company=company,
                 project=project,
                 task=task,

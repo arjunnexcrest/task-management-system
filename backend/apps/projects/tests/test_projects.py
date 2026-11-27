@@ -136,8 +136,10 @@ class ProjectModelsTestCase(TestCase):
             full_name="Developer One",
             password="Password123!",
         )
-        CompanyMembership.objects.create(company=self.company, user=self.user)
-        CompanyMembership.objects.create(company=self.company, user=member_user)
+        CompanyMembership.objects.create(
+            company=self.company, user=self.user, role="CompanyInCharge"
+        )
+        CompanyMembership.objects.create(company=self.company, user=member_user, role="Employee")
         dept2 = Department.objects.create(
             company=self.company,
             name="Design",
@@ -287,8 +289,15 @@ class ProjectModelsTestCase(TestCase):
             full_name="Backend Lead",
             password="Password123!",
         )
-        for u in (self.user, pm2, dept_head, team_leader):
-            CompanyMembership.objects.get_or_create(company=self.company, user=u)
+        for u, r in (
+            (self.user, "CompanyInCharge"),
+            (pm2, "ProjectManager"),
+            (dept_head, "DepartmentHead"),
+            (team_leader, "TeamLeader"),
+        ):
+            CompanyMembership.objects.get_or_create(
+                company=self.company, user=u, defaults={"role": r}
+            )
 
         DepartmentMembership.objects.create(
             department=self.department,
@@ -444,8 +453,17 @@ class ProjectModelsTestCase(TestCase):
             designation="QA Engineer",
             password="Password123!",
         )
-        for u in (self.user, team_lead, team_dev1, team_dev2):
-            CompanyMembership.objects.get_or_create(company=self.company, user=u, status="Active")
+        for u, r in (
+            (self.user, "ProjectManager"),
+            (team_lead, "TeamLeader"),
+            (team_dev1, "Employee"),
+            (team_dev2, "Employee"),
+        ):
+            CompanyMembership.objects.get_or_create(
+                company=self.company,
+                user=u,
+                defaults={"status": "Active", "role": r},
+            )
             DepartmentMembership.objects.get_or_create(
                 department=self.department,
                 user=u,

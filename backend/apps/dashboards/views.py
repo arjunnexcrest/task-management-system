@@ -3,13 +3,15 @@ from decimal import Decimal
 from django.db.models import Avg, Count, Exists, OuterRef, Q, Sum
 from django.utils import timezone
 from rest_framework import permissions
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.accounts.models import User
 from apps.common.permissions import (
+    IsActiveUser,
     IsCEOOnly,
-    IsCompanyMemberOrAllowAnyInDev,
+    IsCompanyMember,
     get_ordered_user_roles,
     get_primary_role,
     get_user_capabilities,
@@ -86,7 +88,7 @@ class DashboardSummaryView(APIView):
     the same authorization rules as task lists.'
     """
 
-    permission_classes = [IsCompanyMemberOrAllowAnyInDev]
+    permission_classes = [IsAuthenticated, IsActiveUser, IsCompanyMember]
 
     def get(self, request):
         projects_qs = get_project_list_queryset(request)

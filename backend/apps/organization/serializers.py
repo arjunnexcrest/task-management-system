@@ -100,6 +100,15 @@ class DepartmentSerializer(CompanyScopedValidationMixin, serializers.ModelSerial
                 {"company": "Moving a department to another company is not allowed."}
             )
 
+        effective_status = attrs.get(
+            "status",
+            getattr(self.instance, "status", Department.Status.ACTIVE),
+        )
+        if company and effective_status == Department.Status.ACTIVE and not company.is_active:
+            raise serializers.ValidationError(
+                {"company": "Cannot create or activate a department under an inactive company."}
+            )
+
         name = attrs.get("name") or getattr(self.instance, "name", None)
         if company and name:
             dup_qs = Department.objects.filter(company=company, name__iexact=name)
@@ -112,10 +121,6 @@ class DepartmentSerializer(CompanyScopedValidationMixin, serializers.ModelSerial
 
         head_id = attrs.get("department_head")
         if company and head_id:
-            effective_status = attrs.get(
-                "status",
-                getattr(self.instance, "status", Department.Status.ACTIVE),
-            )
             if effective_status == Department.Status.INACTIVE:
                 raise serializers.ValidationError(
                     {"department_head": "Cannot assign a Department Head to an inactive department."}
@@ -276,6 +281,14 @@ class DepartmentMembershipSerializer(CompanyScopedValidationMixin, serializers.M
     def validate(self, attrs):
         department = attrs.get("department") or getattr(self.instance, "department", None)
         user = attrs.get("user") or getattr(self.instance, "user", None)
+        effective_status = attrs.get(
+            "status", getattr(self.instance, "status", DepartmentMembership.Status.ACTIVE)
+        )
+        if department and effective_status == DepartmentMembership.Status.ACTIVE:
+            if department.status == Department.Status.INACTIVE:
+                raise serializers.ValidationError(
+                    {"department": "Cannot add an active member to an inactive department."}
+                )
         if department and user:
             _validate_active_company_member(
                 user,
@@ -283,7 +296,45 @@ class DepartmentMembershipSerializer(CompanyScopedValidationMixin, serializers.M
                 field_name="user",
                 field_label="Department member",
             )
+            if effective_status == DepartmentMembership.Status.ACTIVE:
+                dup_qs = DepartmentMembership.objects.filter(
+                    department=department,
+                    user=user,
+                    status=DepartmentMembership.Status.ACTIVE,
+                )
+                if self.instance is not None:
+                    dup_qs = dup_qs.exclude(pk=self.instance.pk)
+                if dup_qs.exists():
+                    raise serializers.ValidationError(
+                        {"user": "This user already has an active membership in this department."}
+                    )
         return attrs
+
+    @transaction.atomic
+    def create(self, validated_data):
+        if (
+            validated_data.get("is_head")
+            and validated_data.get("status", DepartmentMembership.Status.ACTIVE)
+            == DepartmentMembership.Status.ACTIVE
+        ):
+            DepartmentMembership.objects.filter(
+                department=validated_data["department"],
+                status=DepartmentMembership.Status.ACTIVE,
+                is_head=True,
+            ).update(is_head=False)
+        return super().create(validated_data)
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        effective_head = validated_data.get("is_head", instance.is_head)
+        effective_status = validated_data.get("status", instance.status)
+        if effective_head and effective_status == DepartmentMembership.Status.ACTIVE:
+            DepartmentMembership.objects.filter(
+                department=validated_data.get("department", instance.department),
+                status=DepartmentMembership.Status.ACTIVE,
+                is_head=True,
+            ).exclude(pk=instance.pk).update(is_head=False)
+        return super().update(instance, validated_data)
 
 
 class TeamSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
@@ -534,6 +585,14 @@ class TeamMembershipSerializer(CompanyScopedValidationMixin, serializers.ModelSe
     def validate(self, attrs):
         team = attrs.get("team") or getattr(self.instance, "team", None)
         user = attrs.get("user") or getattr(self.instance, "user", None)
+        effective_status = attrs.get(
+            "status", getattr(self.instance, "status", TeamMembership.Status.ACTIVE)
+        )
+        if team and effective_status == TeamMembership.Status.ACTIVE:
+            if team.status == Team.Status.INACTIVE:
+                raise serializers.ValidationError(
+                    {"team": "Cannot add an active member to an inactive team."}
+                )
         if team and user:
             _validate_active_company_member(
                 user,
@@ -541,7 +600,45 @@ class TeamMembershipSerializer(CompanyScopedValidationMixin, serializers.ModelSe
                 field_name="user",
                 field_label="Team member",
             )
+            if effective_status == TeamMembership.Status.ACTIVE:
+                dup_qs = TeamMembership.objects.filter(
+                    team=team,
+                    user=user,
+                    status=TeamMembership.Status.ACTIVE,
+                )
+                if self.instance is not None:
+                    dup_qs = dup_qs.exclude(pk=self.instance.pk)
+                if dup_qs.exists():
+                    raise serializers.ValidationError(
+                        {"user": "This user already has an active membership in this team."}
+                    )
         return attrs
+
+    @transaction.atomic
+    def create(self, validated_data):
+        if (
+            validated_data.get("is_leader")
+            and validated_data.get("status", TeamMembership.Status.ACTIVE)
+            == TeamMembership.Status.ACTIVE
+        ):
+            TeamMembership.objects.filter(
+                team=validated_data["team"],
+                status=TeamMembership.Status.ACTIVE,
+                is_leader=True,
+            ).update(is_leader=False)
+        return super().create(validated_data)
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        effective_leader = validated_data.get("is_leader", instance.is_leader)
+        effective_status = validated_data.get("status", instance.status)
+        if effective_leader and effective_status == TeamMembership.Status.ACTIVE:
+            TeamMembership.objects.filter(
+                team=validated_data.get("team", instance.team),
+                status=TeamMembership.Status.ACTIVE,
+                is_leader=True,
+            ).exclude(pk=instance.pk).update(is_leader=False)
+        return super().update(instance, validated_data)
 
 
 class ReportingRelationshipSerializer(CompanyScopedValidationMixin, serializers.ModelSerializer):
